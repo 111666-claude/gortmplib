@@ -69,11 +69,7 @@ func allocateMessage(raw *rawmessage.Message) (Message, error) {
 		return &DataAMF0{}, nil
 
 	case TypeAudio:
-		if len(raw.Body) < 1 {
-			return nil, fmt.Errorf("not enough bytes")
-		}
-
-		if (raw.Body[0] >> 4) == 9 {
+		if len(raw.Body) >= 1 && (raw.Body[0]>>4) == 9 {
 			extendedType := AudioExType(raw.Body[0] & 0x0F)
 
 			switch extendedType {
@@ -130,6 +126,11 @@ func allocateMessage(raw *rawmessage.Message) (Message, error) {
 				return nil, fmt.Errorf("unsupported video extended type: %v", extendedType)
 			}
 		}
+
+		if raw.Body[0]>>4 == videoFrameTypeCommand {
+			return &VideoCommand{}, nil
+		}
+
 		return &Video{}, nil
 
 	default:

@@ -1043,7 +1043,9 @@ func FuzzReader(f *testing.F) {
 			require.NotEmpty(t, msg.Payload)
 
 		case *message.Audio:
-			if msg.Codec != message.CodecMPEG4Audio || msg.AACType != message.AudioAACTypeConfig {
+			// empty audio messages are keepalives and have no payload
+			if !msg.IsEmpty &&
+				(msg.Codec != message.CodecMPEG4Audio || msg.AACType != message.AudioAACTypeConfig) {
 				require.NotEmpty(t, msg.AU)
 			}
 

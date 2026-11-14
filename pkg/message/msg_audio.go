@@ -57,19 +57,32 @@ type Audio struct {
 	ChunkStreamID   byte
 	DTS             time.Duration
 	MessageStreamID uint32
-	Codec           uint8
-	Rate            AudioRate
-	Depth           AudioDepth
-	IsStereo        bool
-	AACType         AudioAACType                    // Codec = CodecMPEG4Audio
-	AACConfig       *mpeg4audio.AudioSpecificConfig // Codec = CodecMPEG4Audio, AACType = AACTypeConfig
-	AU              []byte
+
+	// IsEmpty is true for messages with an empty body.
+	// Some senders use them as keepalives. They carry neither codec
+	// parameters nor data, and must be ignored.
+	IsEmpty bool
+
+	Codec     uint8
+	Rate      AudioRate
+	Depth     AudioDepth
+	IsStereo  bool
+	AACType   AudioAACType                    // Codec = CodecMPEG4Audio
+	AACConfig *mpeg4audio.AudioSpecificConfig // Codec = CodecMPEG4Audio, AACType = AACTypeConfig
+	AU        []byte
 }
 
 func (m *Audio) unmarshal(raw *rawmessage.Message) error {
 	m.ChunkStreamID = raw.ChunkStreamID
 	m.DTS = raw.Timestamp
 	m.MessageStreamID = raw.MessageStreamID
+
+	// some senders (for example some hardware encoders) send empty audio
+	// messages as keepalives. They carry neither parameters nor data.
+	if len(raw.Body) == 0 {
+		m.IsEmpty = true
+		return nil
+	}
 
 	if len(raw.Body) < 2 {
 		return fmt.Errorf("invalid body size")
@@ -119,6 +132,17 @@ func (m *Audio) unmarshal(raw *rawmessage.Message) error {
 }
 
 func (m Audio) marshal() (*rawmessage.Message, error) {
+	// an empty audio message has an empty body.
+	if m.IsEmpty {
+		return &rawmessage.Message{
+			ChunkStreamID:   m.ChunkStreamID,
+			Timestamp:       m.DTS,
+			Type:            uint8(TypeAudio),
+			MessageStreamID: m.MessageStreamID,
+			Body:            []byte{},
+		}, nil
+	}
+
 	var bodyData []byte
 
 	if m.Codec == CodecMPEG4Audio {

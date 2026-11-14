@@ -473,6 +473,12 @@ func (r *Reader) readTracks() (map[uint8]*Track, map[uint8]*Track, error) {
 			}
 			curTime = msg.DTS
 
+			// an empty audio message carries neither parameters nor data:
+			// it must not cause a track to be discovered.
+			if msg.IsEmpty {
+				break
+			}
+
 			if audioTracks[0] == nil {
 				if msg.Codec == message.CodecMPEG4Audio {
 					if msg.AACType == message.AudioAACTypeConfig {
@@ -924,7 +930,19 @@ func (r *Reader) Read() error {
 
 		return r.onVideoData[0](msg)
 
-	case *message.Audio, *message.AudioExCodedFrames:
+	case *message.Audio:
+		// empty audio keepalive messages do not contain any data.
+		if msg.IsEmpty {
+			return nil
+		}
+
+		if r.audioTracks[0] == nil {
+			return fmt.Errorf("received a packet for audio track 0, but track is not set up")
+		}
+
+		return r.onAudioData[0](msg)
+
+	case *message.AudioExCodedFrames:
 		if r.audioTracks[0] == nil {
 			return fmt.Errorf("received a packet for audio track 0, but track is not set up")
 		}

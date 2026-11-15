@@ -61,6 +61,12 @@ type OnDataG711Func func(pts time.Duration, samples []byte)
 // samples is guaranteed to contain at least 1 byte.
 type OnDataLPCMFunc func(pts time.Duration, samples []byte)
 
+// OnParamsH264Func is the prototype of the callback passed to OnParamsH264().
+type OnParamsH264Func func(sps []byte, pps []byte)
+
+// OnParamsH265Func is the prototype of the callback passed to OnParamsH265().
+type OnParamsH265Func func(vps []byte, sps []byte, pps []byte)
+
 func h265FindParams(hvcc *mp4.HvcC) ([]byte, []byte, []byte, error) {
 	var vps []byte
 	var sps []byte
@@ -286,6 +292,7 @@ type Reader struct {
 	audioTracks          map[uint8]*Track
 	onVideoData          map[uint8]func(message.Message) error
 	onVideoDataFinalizer map[uint8]func()
+	onVideoParams        map[uint8]func(message.Message) error
 	onAudioData          map[uint8]func(message.Message) error
 }
 
@@ -311,6 +318,7 @@ func (r *Reader) Initialize() error {
 
 	r.onVideoData = make(map[uint8]func(message.Message) error)
 	r.onVideoDataFinalizer = make(map[uint8]func())
+	r.onVideoParams = make(map[uint8]func(message.Message) error)
 	r.onAudioData = make(map[uint8]func(message.Message) error)
 
 	return nil
@@ -325,16 +333,21 @@ func (r *Reader) readTracks() (map[uint8]*Track, map[uint8]*Track, error) {
 	audioTracks := make(map[uint8]*Track)
 
 	handleVideoSequenceStart := func(trackID uint8, msg *message.VideoExSequenceStart) error {
-		if videoTracks[trackID] != nil {
-			return fmt.Errorf("video track %d already setupped", trackID)
-		}
-
-		var err error
-		videoTracks[trackID], err = videoTrackFromSequenceStart(msg)
+		newTrack, err := videoTrackFromSequenceStart(msg)
 		if err != nil {
 			return err
 		}
 
+		if existing := videoTracks[trackID]; existing != nil {
+			// configuration update of an existing track.
+			// a codec change is not a valid parameter update.
+			if newTrack.Codec.ID() != existing.Codec.ID() {
+				return fmt.Errorf("video track %d changed codec from %d to %d",
+					trackID, existing.Codec.ID(), newTrack.Codec.ID())
+			}
+		}
+
+		videoTracks[trackID] = newTrack
 		return nil
 	}
 
@@ -405,26 +418,46 @@ func (r *Reader) readTracks() (map[uint8]*Track, map[uint8]*Track, error) {
 			}
 			curTime = msg.DTS
 
-			if msg.PacketType == message.VideoPacketTypeConfig && videoTracks[0] == nil {
+			if msg.PacketType == message.VideoPacketTypeConfig {
 				switch msg.Codec {
 				case message.CodecH264:
 					if msg.AVCConfig != nil {
 						// SPS, PPS are guaranteed to be present by message.Video
-						videoTracks[0] = &Track{Codec: &codecs.H264{
-							SPS: msg.AVCConfig.SequenceParameterSets[0].NALUnit,
-							PPS: msg.AVCConfig.PictureParameterSets[0].NALUnit,
-						}}
+						sps := msg.AVCConfig.SequenceParameterSets[0].NALUnit
+						pps := msg.AVCConfig.PictureParameterSets[0].NALUnit
+
+						if videoTracks[0] == nil {
+							videoTracks[0] = &Track{Codec: &codecs.H264{
+								SPS: sps,
+								PPS: pps,
+							}}
+						} else if codec, ok := videoTracks[0].Codec.(*codecs.H264); ok {
+							// configuration update of an existing track
+							codec.SPS = sps
+							codec.PPS = pps
+						} else {
+							return nil, nil, fmt.Errorf("video track 0 changed codec to %d", message.CodecH264)
+						}
 					}
 
 				case message.CodecH265:
 					// VPS, SPS, PPS are guaranteed to be present by message.Video
 					vps, sps, pps, _ := h265FindParams(msg.HEVCConfig)
 
-					videoTracks[0] = &Track{Codec: &codecs.H265{
-						VPS: vps,
-						SPS: sps,
-						PPS: pps,
-					}}
+					if videoTracks[0] == nil {
+						videoTracks[0] = &Track{Codec: &codecs.H265{
+							VPS: vps,
+							SPS: sps,
+							PPS: pps,
+						}}
+					} else if codec, ok := videoTracks[0].Codec.(*codecs.H265); ok {
+						// configuration update of an existing track
+						codec.VPS = vps
+						codec.SPS = sps
+						codec.PPS = pps
+					} else {
+						return nil, nil, fmt.Errorf("video track 0 changed codec to %d", message.CodecH265)
+					}
 				}
 			}
 
@@ -824,6 +857,135 @@ func (r *Reader) OnDataH264(track *Track, cb OnDataH26xFunc) {
 	}
 }
 
+// OnParamsH264 sets a callback that is called when the H264 parameters of a
+// track are received. This includes both the initial configuration and any
+// subsequent configuration update. The parameters of the track are updated
+// before the callback is called.
+func (r *Reader) OnParamsH264(track *Track, cb OnParamsH264Func) {
+	r.onVideoParams[r.videoTrackID(track)] = func(msg message.Message) error {
+		switch msg := msg.(type) {
+		case *message.Video:
+			if msg.AVCConfig != nil {
+				// SPS, PPS are guaranteed to be present by message.Video
+				cb(msg.AVCConfig.SequenceParameterSets[0].NALUnit,
+					msg.AVCConfig.PictureParameterSets[0].NALUnit)
+			}
+
+		case *message.VideoExSequenceStart:
+			// SPS, PPS are guaranteed to be present by message.VideoExSequenceStart
+			cb(msg.AVCConfig.SequenceParameterSets[0].NALUnit,
+				msg.AVCConfig.PictureParameterSets[0].NALUnit)
+		}
+		return nil
+	}
+}
+
+// OnParamsH265 sets a callback that is called when the H265 parameters of a
+// track are received. This includes both the initial configuration and any
+// subsequent configuration update. The parameters of the track are updated
+// before the callback is called.
+func (r *Reader) OnParamsH265(track *Track, cb OnParamsH265Func) {
+	r.onVideoParams[r.videoTrackID(track)] = func(msg message.Message) error {
+		switch msg := msg.(type) {
+		case *message.Video:
+			// VPS, SPS, PPS are guaranteed to be present by message.Video
+			vps, sps, pps, _ := h265FindParams(msg.HEVCConfig)
+			cb(vps, sps, pps)
+
+		case *message.VideoExSequenceStart:
+			// VPS, SPS, PPS are guaranteed to be present by message.VideoExSequenceStart
+			vps, sps, pps, _ := h265FindParams(msg.HEVCConfig)
+			cb(vps, sps, pps)
+		}
+		return nil
+	}
+}
+
+// updateVideoTrackParams applies a configuration message to a video track and
+// notifies the params callback, if any. The track is updated atomically: in
+// case of error, it is left untouched.
+func (r *Reader) updateVideoTrackParams(trackID uint8, msg message.Message) error {
+	track := r.videoTracks[trackID]
+
+	switch msg := msg.(type) {
+	case *message.Video:
+		switch msg.Codec {
+		case message.CodecH264:
+			if msg.AVCConfig == nil {
+				return nil
+			}
+
+			codec, ok := track.Codec.(*codecs.H264)
+			if !ok {
+				return fmt.Errorf("received a H264 configuration for video track %d, "+
+					"but the track uses a different codec", trackID)
+			}
+
+			// SPS, PPS are guaranteed to be present by message.Video
+			codec.SPS = msg.AVCConfig.SequenceParameterSets[0].NALUnit
+			codec.PPS = msg.AVCConfig.PictureParameterSets[0].NALUnit
+
+		case message.CodecH265:
+			codec, ok := track.Codec.(*codecs.H265)
+			if !ok {
+				return fmt.Errorf("received a H265 configuration for video track %d, "+
+					"but the track uses a different codec", trackID)
+			}
+
+			// VPS, SPS, PPS are guaranteed to be present by message.Video
+			vps, sps, pps, _ := h265FindParams(msg.HEVCConfig)
+			codec.VPS = vps
+			codec.SPS = sps
+			codec.PPS = pps
+		}
+
+	case *message.VideoExSequenceStart:
+		switch msg.FourCC {
+		case message.FourCCAVC:
+			codec, ok := track.Codec.(*codecs.H264)
+			if !ok {
+				return fmt.Errorf("received a H264 configuration for video track %d, "+
+					"but the track uses a different codec", trackID)
+			}
+
+			// SPS, PPS are guaranteed to be present by message.VideoExSequenceStart
+			codec.SPS = msg.AVCConfig.SequenceParameterSets[0].NALUnit
+			codec.PPS = msg.AVCConfig.PictureParameterSets[0].NALUnit
+
+		case message.FourCCHEVC:
+			codec, ok := track.Codec.(*codecs.H265)
+			if !ok {
+				return fmt.Errorf("received a H265 configuration for video track %d, "+
+					"but the track uses a different codec", trackID)
+			}
+
+			// VPS, SPS, PPS are guaranteed to be present by message.VideoExSequenceStart
+			vps, sps, pps, _ := h265FindParams(msg.HEVCConfig)
+			codec.VPS = vps
+			codec.SPS = sps
+			codec.PPS = pps
+
+		case message.FourCCAV1:
+			if _, ok := track.Codec.(*codecs.AV1); !ok {
+				return fmt.Errorf("received a AV1 configuration for video track %d, "+
+					"but the track uses a different codec", trackID)
+			}
+
+		case message.FourCCVP9:
+			if _, ok := track.Codec.(*codecs.VP9); !ok {
+				return fmt.Errorf("received a VP9 configuration for video track %d, "+
+					"but the track uses a different codec", trackID)
+			}
+		}
+	}
+
+	if cb, ok := r.onVideoParams[trackID]; ok {
+		return cb(msg)
+	}
+
+	return nil
+}
+
 // OnDataOpus sets a callback that is called when Opus data is received.
 func (r *Reader) OnDataOpus(track *Track, cb OnDataOpusFunc) {
 	r.onAudioData[r.audioTrackID(track)] = func(msg message.Message) error {
@@ -940,7 +1102,28 @@ func (r *Reader) Read() error {
 			return liberrors.ErrReaderUnpublished{}
 		}
 
-	case *message.Video, *message.VideoExCodedFrames, *message.VideoExFramesX:
+	case *message.Video:
+		if r.videoTracks[0] == nil {
+			return fmt.Errorf("received a packet for video track 0, but track is not set up")
+		}
+
+		if msg.PacketType == message.VideoPacketTypeConfig {
+			err := r.updateVideoTrackParams(0, msg)
+			if err != nil {
+				return err
+			}
+		}
+
+		return r.onVideoData[0](msg)
+
+	case *message.VideoExSequenceStart:
+		if r.videoTracks[0] == nil {
+			return fmt.Errorf("received a packet for video track 0, but track is not set up")
+		}
+
+		return r.updateVideoTrackParams(0, msg)
+
+	case *message.VideoExCodedFrames, *message.VideoExFramesX:
 		if r.videoTracks[0] == nil {
 			return fmt.Errorf("received a packet for video track 0, but track is not set up")
 		}
@@ -956,6 +1139,13 @@ func (r *Reader) Read() error {
 
 	case *message.VideoExMultitrack:
 		switch wmsg := msg.Wrapped.(type) {
+		case *message.VideoExSequenceStart:
+			if r.videoTracks[msg.TrackID] == nil {
+				return fmt.Errorf("received a packet for video track %d, but track is not set up", msg.TrackID)
+			}
+
+			return r.updateVideoTrackParams(msg.TrackID, wmsg)
+
 		case *message.VideoExCodedFrames, *message.VideoExFramesX:
 			if r.videoTracks[msg.TrackID] == nil {
 				return fmt.Errorf("received a packet for video track %d, but track is not set up", msg.TrackID)

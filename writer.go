@@ -1,6 +1,7 @@
 package gortmplib
 
 import (
+	"bytes"
 	"fmt"
 	"strconv"
 	"time"
@@ -192,15 +193,25 @@ func mpeg1AudioChannels(m mpeg1audio.ChannelMode) bool {
 	return m != mpeg1audio.ChannelModeMono
 }
 
+// writerVideoTrackState contains the state of a video track of a Writer.
+type writerVideoTrackState struct {
+	id  uint8
+	vps []byte // H265 only
+	sps []byte
+	pps []byte
+	dts time.Duration
+}
+
 // Writer provides functions to write outgoing data.
 type Writer struct {
 	Conn   Conn
 	Tracks []*Track
 
-	videoTrackToID map[*Track]uint8
-	audioTrackToID map[*Track]uint8
-	readerDone     chan struct{}
-	readerErr      error
+	videoTrackToID  map[*Track]uint8
+	audioTrackToID  map[*Track]uint8
+	videoTrackState map[*Track]*writerVideoTrackState
+	readerDone      chan struct{}
+	readerErr       error
 }
 
 // Initialize initializes Writer.
@@ -233,6 +244,7 @@ func (w *Writer) Wait() error {
 func (w *Writer) writeTracks() error {
 	w.videoTrackToID = make(map[*Track]uint8)
 	w.audioTrackToID = make(map[*Track]uint8)
+	w.videoTrackState = make(map[*Track]*writerVideoTrackState)
 
 	var videoTracks []*Track
 	var audioTracks []*Track
@@ -340,6 +352,9 @@ func (w *Writer) writeTracks() error {
 	}
 
 	for id, track := range videoTracks {
+		state := &writerVideoTrackState{id: uint8(id)}
+		w.videoTrackState[track] = state
+
 		switch codec := track.Codec.(type) {
 		case *codecs.AV1:
 			// TODO: fill properly.
@@ -413,6 +428,10 @@ func (w *Writer) writeTracks() error {
 				pps = h265DefaultPPS
 			}
 
+			state.vps = vps
+			state.sps = sps
+			state.pps = pps
+
 			var hvcc *mp4.HvcC
 			hvcc, err = generateHvcC(vps, sps, pps)
 			if err != nil {
@@ -446,6 +465,9 @@ func (w *Writer) writeTracks() error {
 				sps = h264DefaultSPS
 				pps = h264DefaultPPS
 			}
+
+			state.sps = sps
+			state.pps = pps
 
 			var avcc *mp4.AVCDecoderConfiguration
 			avcc, err = generateAvcC(sps, pps)
@@ -614,6 +636,10 @@ func (w *Writer) reader() {
 
 // WriteAV1 writes a AV1 temporal unit.
 func (w *Writer) WriteAV1(track *Track, pts time.Duration, tu [][]byte) error {
+	if state, ok := w.videoTrackState[track]; ok {
+		state.dts = pts
+	}
+
 	// FFmpeg requires this.
 	tu = append([][]byte{{byte(av1.OBUTypeTemporalDelimiter << 3)}}, tu...)
 
@@ -651,6 +677,10 @@ func (w *Writer) WriteAV1(track *Track, pts time.Duration, tu [][]byte) error {
 
 // WriteVP9 writes a VP9 frame.
 func (w *Writer) WriteVP9(track *Track, pts time.Duration, frame []byte) error {
+	if state, ok := w.videoTrackState[track]; ok {
+		state.dts = pts
+	}
+
 	frameType := message.VideoFrameTypeInterFrame
 	if vp9.IsRandomAccess(frame) {
 		frameType = message.VideoFrameTypeKeyFrame
@@ -680,6 +710,10 @@ func (w *Writer) WriteVP9(track *Track, pts time.Duration, frame []byte) error {
 
 // WriteH265 writes a H265 access unit.
 func (w *Writer) WriteH265(track *Track, pts time.Duration, dts time.Duration, au [][]byte) error {
+	if state, ok := w.videoTrackState[track]; ok {
+		state.dts = dts
+	}
+
 	avcc, err := h264.AVCC(au).Marshal()
 	if err != nil {
 		return err
@@ -728,6 +762,10 @@ func (w *Writer) WriteH265(track *Track, pts time.Duration, dts time.Duration, a
 
 // WriteH264 writes a H264 access unit.
 func (w *Writer) WriteH264(track *Track, pts time.Duration, dts time.Duration, au [][]byte) error {
+	if state, ok := w.videoTrackState[track]; ok {
+		state.dts = dts
+	}
+
 	avcc, err := h264.AVCC(au).Marshal()
 	if err != nil {
 		return err
@@ -781,6 +819,127 @@ func (w *Writer) WriteH264(track *Track, pts time.Duration, dts time.Duration, a
 		TrackID:        id,
 		Wrapped:        msg,
 	})
+}
+
+// UpdateH264Params updates the SPS and PPS of a H264 track.
+// The new configuration is sent immediately, therefore it applies to frames
+// written after this call, that must start with a key frame.
+// Frames already written keep the previous configuration.
+// If the provided parameters are identical to the ones currently in use,
+// nothing is sent.
+func (w *Writer) UpdateH264Params(track *Track, sps []byte, pps []byte) error {
+	state, ok := w.videoTrackState[track]
+	if !ok {
+		return fmt.Errorf("track is not a video track of this writer")
+	}
+
+	if _, ok := track.Codec.(*codecs.H264); !ok {
+		return fmt.Errorf("track is not a H264 track")
+	}
+
+	if len(sps) == 0 || len(pps) == 0 {
+		return fmt.Errorf("SPS and PPS must be provided")
+	}
+
+	if bytes.Equal(state.sps, sps) && bytes.Equal(state.pps, pps) {
+		return nil
+	}
+
+	avcc, err := generateAvcC(sps, pps)
+	if err != nil {
+		return fmt.Errorf("invalid H264 parameters: %w", err)
+	}
+
+	if state.id == 0 {
+		err = w.Conn.Write(&message.Video{
+			ChunkStreamID:   message.VideoChunkStreamID,
+			MessageStreamID: 0x1000000,
+			Codec:           message.CodecH264,
+			FrameType:       message.VideoFrameTypeKeyFrame,
+			PacketType:      message.VideoPacketTypeConfig,
+			AVCConfig:       avcc,
+			DTS:             state.dts,
+		})
+	} else {
+		err = w.Conn.Write(&message.VideoExMultitrack{
+			MultitrackType: 0x0,
+			TrackID:        state.id,
+			Wrapped: &message.VideoExSequenceStart{
+				ChunkStreamID:   message.VideoChunkStreamID,
+				MessageStreamID: 0x1000000,
+				FrameType:       message.VideoFrameTypeKeyFrame,
+				FourCC:          message.FourCCAVC,
+				AVCConfig:       avcc,
+				DTS:             state.dts,
+			},
+		})
+	}
+	if err != nil {
+		return err
+	}
+
+	state.sps = append([]byte(nil), sps...)
+	state.pps = append([]byte(nil), pps...)
+
+	return nil
+}
+
+// UpdateH265Params updates the VPS, SPS and PPS of a H265 track.
+// The new configuration is sent immediately, therefore it applies to frames
+// written after this call, that must start with a key frame.
+// Frames already written keep the previous configuration.
+// If the provided parameters are identical to the ones currently in use,
+// nothing is sent.
+func (w *Writer) UpdateH265Params(track *Track, vps []byte, sps []byte, pps []byte) error {
+	state, ok := w.videoTrackState[track]
+	if !ok {
+		return fmt.Errorf("track is not a video track of this writer")
+	}
+
+	if _, ok := track.Codec.(*codecs.H265); !ok {
+		return fmt.Errorf("track is not a H265 track")
+	}
+
+	if len(vps) == 0 || len(sps) == 0 || len(pps) == 0 {
+		return fmt.Errorf("VPS, SPS and PPS must be provided")
+	}
+
+	if bytes.Equal(state.vps, vps) && bytes.Equal(state.sps, sps) && bytes.Equal(state.pps, pps) {
+		return nil
+	}
+
+	hvcc, err := generateHvcC(vps, sps, pps)
+	if err != nil {
+		return fmt.Errorf("invalid H265 parameters: %w", err)
+	}
+
+	var msg message.Message = &message.VideoExSequenceStart{
+		ChunkStreamID:   message.VideoChunkStreamID,
+		MessageStreamID: 0x1000000,
+		FrameType:       message.VideoFrameTypeKeyFrame,
+		FourCC:          message.FourCCHEVC,
+		HEVCConfig:      hvcc,
+		DTS:             state.dts,
+	}
+
+	if state.id != 0 {
+		msg = &message.VideoExMultitrack{
+			MultitrackType: 0x0,
+			TrackID:        state.id,
+			Wrapped:        msg,
+		}
+	}
+
+	err = w.Conn.Write(msg)
+	if err != nil {
+		return err
+	}
+
+	state.vps = append([]byte(nil), vps...)
+	state.sps = append([]byte(nil), sps...)
+	state.pps = append([]byte(nil), pps...)
+
+	return nil
 }
 
 // WriteOpus writes a Opus packet.

@@ -3,6 +3,7 @@ package message
 import (
 	"bytes"
 	"fmt"
+	"time"
 
 	"github.com/abema/go-mp4"
 
@@ -12,6 +13,7 @@ import (
 // VideoExSequenceStart is a sequence start extended message.
 type VideoExSequenceStart struct {
 	ChunkStreamID   byte
+	DTS             time.Duration
 	MessageStreamID uint32
 	FrameType       VideoFrameType
 	FourCC          FourCC
@@ -38,6 +40,7 @@ func (m *VideoExSequenceStart) unmarshal(raw *rawmessage.Message) error {
 
 	m.ChunkStreamID = raw.ChunkStreamID
 	m.MessageStreamID = raw.MessageStreamID
+	m.DTS = raw.Timestamp
 	m.FrameType = VideoFrameType((raw.Body[0] >> 4) & 0b111)
 	if m.FrameType == VideoFrameTypeCommand {
 		return fmt.Errorf("video command frames in extended messages are not supported")
@@ -147,6 +150,7 @@ func (m VideoExSequenceStart) marshal() (*rawmessage.Message, error) {
 		ChunkStreamID:   m.ChunkStreamID,
 		Type:            uint8(TypeVideo),
 		MessageStreamID: m.MessageStreamID,
+		Timestamp:       m.DTS,
 		Body:            body,
 	}, nil
 }

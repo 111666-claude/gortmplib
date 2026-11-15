@@ -136,6 +136,20 @@ var cases = []struct {
 			Body:          []byte{5, 6, 7, 8},
 		},
 	},
+	{
+		"chunk3 extended timestamp with value",
+		[]byte{
+			0xd9, 0xff, 0x34, 0x86, 0xa2, 0x05, 0x06, 0x07,
+			0x08,
+		},
+		4,
+		true,
+		&chunk.Chunk3{
+			ChunkStreamID:     25,
+			ExtendedTimestamp: 0xFF3486A2,
+			Body:              []byte{5, 6, 7, 8},
+		},
+	},
 }
 
 func TestChunkRead(t *testing.T) {

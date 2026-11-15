@@ -2,6 +2,8 @@ package rawmessage_test
 
 import (
 	"bytes"
+	"encoding/binary"
+	"fmt"
 	"io"
 	"reflect"
 	"sync"
@@ -38,7 +40,7 @@ func chunkHasExtendedTimestamp(ch chunk.Chunk) bool {
 	case *chunk.Chunk2:
 		return ch.TimestampDelta >= 0xFFFFFF
 	case *chunk.Chunk3:
-		return false
+		return ch.ExtendedTimestamp != 0
 	}
 	return false
 }
@@ -193,6 +195,261 @@ func TestWriterConcurrent(t *testing.T) {
 
 	_, err := r.Read()
 	require.ErrorIs(t, err, io.EOF)
+}
+
+func TestWriterExtendedTimestampContinuation(t *testing.T) {
+	// A 260-byte message with a timestamp of 0xFFFFFF milliseconds is split
+	// into 3 chunks (128 + 128 + 4 bytes). Both continuation (type 3) chunks
+	// must carry the full 0xFFFFFF value in their extended timestamp field,
+	// instead of four zero bytes.
+	const (
+		chunkStreamID   = 27
+		msgType         = 9
+		messageStreamID = uint32(3123)
+		bodyLen         = 260
+		timestamp       = uint32(0xFFFFFF)
+	)
+
+	body := make([]byte, bodyLen)
+	for i := range body {
+		body[i] = byte(i)
+	}
+
+	msg := &rawmessage.Message{
+		ChunkStreamID:   chunkStreamID,
+		Timestamp:       time.Duration(timestamp) * time.Millisecond,
+		Type:            msgType,
+		MessageStreamID: messageStreamID,
+		Body:            body,
+	}
+
+	// expected wire layout of one message
+	expected := func() []byte {
+		var b bytes.Buffer
+
+		// chunk0: basic header (1) + message header (11) + extended (4) + body (128)
+		b.Write([]byte{chunkStreamID, 0xFF, 0xFF, 0xFF, 0x00, 0x01, 0x04, msgType})
+		hdr := make([]byte, 4)
+		binary.BigEndian.PutUint32(hdr, messageStreamID)
+		b.Write(hdr)
+		b.Write([]byte{0x00, 0xFF, 0xFF, 0xFF})
+		b.Write(body[:128])
+
+		// first chunk3: basic header (1) + extended timestamp (5) + body (128)
+		b.Write([]byte{3<<6 | chunkStreamID, 0x00, 0xFF, 0xFF, 0xFF})
+		b.Write(body[128:256])
+
+		// second chunk3: basic header (1) + extended timestamp (5) + body (4)
+		b.Write([]byte{3<<6 | chunkStreamID, 0x00, 0xFF, 0xFF, 0xFF})
+		b.Write(body[256:])
+
+		return b.Bytes()
+	}()
+
+	for round := 0; round < 100; round++ {
+		t.Run(fmt.Sprintf("round%d", round), func(t *testing.T) {
+			var buf bytes.Buffer
+			bc := bytecounter.NewWriter(&buf)
+			w := &rawmessage.Writer{
+				BW:               bc,
+				BCW:              bc,
+				CheckAcknowledge: true,
+			}
+			w.Initialize()
+
+			err := w.Write(msg)
+			require.NoError(t, err)
+
+			// the written bytes must be byte-exact, round after round
+			require.Equal(t, expected, buf.Bytes())
+
+			// the two continuation headers must be byte-exact
+			require.Equal(t,
+				[]byte{3<<6 | chunkStreamID, 0x00, 0xFF, 0xFF, 0xFF},
+				buf.Bytes()[12+4+128:12+4+128+5])
+			require.Equal(t,
+				[]byte{3<<6 | chunkStreamID, 0x00, 0xFF, 0xFF, 0xFF},
+				buf.Bytes()[12+4+128+5+128:12+4+128+5+128+5])
+
+			// reading the written bytes back must restore the original message
+			bcr := bytecounter.NewReader(bytes.NewReader(buf.Bytes()))
+			r := rawmessage.NewReader(bcr, bcr, nil)
+			dec, err := r.Read()
+			require.NoError(t, err)
+			require.Equal(t, msg, dec)
+
+			_, err = r.Read()
+			require.ErrorIs(t, err, io.EOF)
+		})
+	}
+}
+
+func TestWriterExtendedTimestampBoundary(t *testing.T) {
+	// timestamps below the boundary use the regular 3-byte field, while the
+	// boundary value and values above it switch to the extended field; the
+	// continuation chunks of a split message must repeat that value.
+	for _, ca := range []struct {
+		name      string
+		timestamp uint32
+		extended  bool
+	}{
+		{"just before boundary", 0xFFFFFE, false},
+		{"at boundary", 0xFFFFFF, true},
+		{"just after boundary", 0x1000000, true},
+	} {
+		t.Run(ca.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			bc := bytecounter.NewWriter(&buf)
+			w := &rawmessage.Writer{
+				BW:               bc,
+				BCW:              bc,
+				CheckAcknowledge: true,
+			}
+			w.Initialize()
+
+			err := w.Write(&rawmessage.Message{
+				ChunkStreamID:   27,
+				Timestamp:       time.Duration(ca.timestamp) * time.Millisecond,
+				Type:            9,
+				MessageStreamID: 3123,
+				Body:            bytes.Repeat([]byte{0x01}, 260),
+			})
+			require.NoError(t, err)
+
+			raw := buf.Bytes()
+
+			if ca.extended {
+				// type 0 chunk marker and extended marker
+				require.Equal(t, byte(0x1B), raw[0])
+				require.Equal(t, []byte{0xFF, 0xFF, 0xFF}, raw[1:4])
+				require.Equal(t,
+					[]byte{byte(ca.timestamp >> 24), byte(ca.timestamp >> 16),
+						byte(ca.timestamp >> 8), byte(ca.timestamp)},
+					raw[12:16])
+
+				// both continuation chunks carry the same extended timestamp
+				off := 16 + 128
+				require.Equal(t, byte(3<<6|27), raw[off])
+				require.Equal(t,
+					[]byte{byte(ca.timestamp >> 24), byte(ca.timestamp >> 16),
+						byte(ca.timestamp >> 8), byte(ca.timestamp)},
+					raw[off+1:off+5])
+
+				off += 5 + 128
+				require.Equal(t, byte(3<<6|27), raw[off])
+				require.Equal(t,
+					[]byte{byte(ca.timestamp >> 24), byte(ca.timestamp >> 16),
+						byte(ca.timestamp >> 8), byte(ca.timestamp)},
+					raw[off+1:off+5])
+			} else {
+				require.Equal(t, byte(0x1B), raw[0])
+				require.Equal(t,
+					[]byte{byte(ca.timestamp >> 16), byte(ca.timestamp >> 8), byte(ca.timestamp)},
+					raw[1:4])
+
+				// no extended field: continuation header is a single byte
+				off := 12 + 128
+				require.Equal(t, byte(3<<6|27), raw[off])
+				require.Equal(t, byte(3<<6|27), raw[off+128+1])
+			}
+
+			// the message must survive a write/read round trip
+			bcr := bytecounter.NewReader(bytes.NewReader(raw))
+			r := rawmessage.NewReader(bcr, bcr, nil)
+			dec, err := r.Read()
+			require.NoError(t, err)
+			require.Equal(t, time.Duration(ca.timestamp)*time.Millisecond, dec.Timestamp)
+			require.Len(t, dec.Body, 260)
+		})
+	}
+}
+
+func TestWriterExtendedTimestampProgression(t *testing.T) {
+	// consecutive split messages across the boundary must keep advancing
+	// their timestamps correctly, in both type 1 (delta) and type 2 (delta)
+	// header forms, with correct extended values on continuation chunks.
+	var buf bytes.Buffer
+	bc := bytecounter.NewWriter(&buf)
+	w := &rawmessage.Writer{
+		BW:               bc,
+		BCW:              bc,
+		CheckAcknowledge: true,
+	}
+	w.Initialize()
+
+	messages := []*rawmessage.Message{
+		{ // type 0, absolute timestamp at boundary
+			ChunkStreamID: 27,
+			Timestamp:     0xFFFFFF * time.Millisecond,
+			Type:          9,
+			Body:          bytes.Repeat([]byte{0x01}, 200),
+		},
+		{ // type 1 (different body length), delta of 0xFFFFFF
+			ChunkStreamID: 27,
+			Timestamp:     (0xFFFFFF + 0xFFFFFF) * time.Millisecond,
+			Type:          9,
+			Body:          bytes.Repeat([]byte{0x02}, 201),
+		},
+		{ // type 2 (same length), delta of 1
+			ChunkStreamID: 27,
+			Timestamp:     (0xFFFFFF + 0xFFFFFF + 1) * time.Millisecond,
+			Type:          9,
+			Body:          bytes.Repeat([]byte{0x03}, 201),
+		},
+		{ // type 2 (same length), extended delta of 0xFFFFFF
+			ChunkStreamID: 27,
+			Timestamp:     (0xFFFFFF + 0xFFFFFF + 1 + 0xFFFFFF) * time.Millisecond,
+			Type:          9,
+			Body:          bytes.Repeat([]byte{0x04}, 201),
+		},
+	}
+
+	for _, msg := range messages {
+		err := w.Write(msg)
+		require.NoError(t, err)
+	}
+
+	bcr := bytecounter.NewReader(bytes.NewReader(buf.Bytes()))
+	r := rawmessage.NewReader(bcr, bcr, nil)
+
+	for _, msg := range messages {
+		dec, err := r.Read()
+		require.NoError(t, err)
+		require.Equal(t, msg.Timestamp, dec.Timestamp)
+		require.Equal(t, msg.Body, dec.Body)
+	}
+
+	_, err := r.Read()
+	require.ErrorIs(t, err, io.EOF)
+
+	// byte-level checks: each continuation chunk must repeat the extended
+	// timestamp/delta of the message's first chunk instead of zero bytes.
+	raw := buf.Bytes()
+
+	// first message (type 0, len 200): 16 (header) + 128 + 5 (chunk3 header) + 72
+	firstEnd := 16 + 128 + 5 + 72
+	// second message starts with a type 1: 12 (header) + 128
+	contOff := firstEnd + 12 + 128
+	require.Equal(t, byte(3<<6|27), raw[contOff])
+	require.Equal(t,
+		[]byte{0x00, 0xFF, 0xFF, 0xFF},
+		raw[contOff+1:contOff+5])
+
+	// second message (len 201): ... + 5 (chunk3 header) + 73
+	secondEnd := firstEnd + 12 + 128 + 5 + 73
+	// third message (type 2, small delta): 4 (header) + 128 + 1 (chunk3 header) + 73
+	thirdEnd := secondEnd + 4 + 128 + 1 + 73
+	// fourth message (type 2, extended delta): 8 (header) + 128
+	contOff = thirdEnd + 8 + 128
+	require.Equal(t, byte(3<<6|27), raw[contOff])
+	require.Equal(t,
+		[]byte{0x00, 0xFF, 0xFF, 0xFF},
+		raw[contOff+1:contOff+5])
+
+	// the type 2 header itself carries the extended delta
+	require.Equal(t,
+		[]byte{2<<6 | 27, 0xFF, 0xFF, 0xFF, 0x00, 0xFF, 0xFF, 0xFF},
+		raw[thirdEnd:thirdEnd+8])
 }
 
 func BenchmarkWriter(b *testing.B) {

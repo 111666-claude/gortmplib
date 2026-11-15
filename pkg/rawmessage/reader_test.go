@@ -196,8 +196,9 @@ var cases = []struct {
 				Body:            bytes.Repeat([]byte{5}, 128),
 			},
 			&chunk.Chunk3{
-				ChunkStreamID: 27,
-				Body:          bytes.Repeat([]byte{5}, 32),
+				ChunkStreamID:     27,
+				ExtendedTimestamp: 4279383126,
+				Body:              bytes.Repeat([]byte{5}, 32),
 			},
 		},
 	},

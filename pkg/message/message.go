@@ -27,6 +27,7 @@ const (
 	TypeDataAMF0         Type = 18
 	TypeCommandAMF3      Type = 17
 	TypeCommandAMF0      Type = 20
+	TypeAggregate        Type = 22
 )
 
 // UserControlType is a user control type.

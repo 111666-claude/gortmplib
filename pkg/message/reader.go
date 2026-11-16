@@ -68,6 +68,9 @@ func allocateMessage(raw *rawmessage.Message) (Message, error) {
 	case TypeDataAMF0:
 		return &DataAMF0{}, nil
 
+	case TypeAggregate:
+		return &Aggregate{}, nil
+
 	case TypeAudio:
 		// empty messages are sent by some servers (e.g. Wowza)
 		if len(raw.Body) == 0 {
@@ -144,7 +147,8 @@ type Reader struct {
 	BCR         *bytecounter.Reader
 	OnAckNeeded func(uint32) error
 
-	rmr *rawmessage.Reader
+	rmr     *rawmessage.Reader
+	pending []Message
 }
 
 // Initialize initializes the Reader.
@@ -155,6 +159,7 @@ func (r *Reader) Initialize() {
 		OnAckNeeded: r.OnAckNeeded,
 	}
 	r.rmr.Initialize()
+	r.pending = nil
 }
 
 // NewReader allocates a Reader.
@@ -175,7 +180,16 @@ func NewReader(
 }
 
 // Read reads a Message.
+// Aggregate messages are transparently split: their contained messages are
+// returned one by one, in order and with absolute timestamps.
 func (r *Reader) Read() (Message, error) {
+	// drain messages produced by a previously read aggregate first
+	if len(r.pending) != 0 {
+		msg := r.pending[0]
+		r.pending = r.pending[1:]
+		return msg, nil
+	}
+
 	raw, err := r.rmr.Read()
 	if err != nil {
 		return nil, err
@@ -203,6 +217,11 @@ func (r *Reader) Read() (Message, error) {
 
 	case *SetWindowAckSize:
 		r.rmr.SetWindowAckSize(tmsg.Value)
+
+	case *Aggregate:
+		first := tmsg.Messages[0]
+		r.pending = tmsg.Messages[1:]
+		msg = first
 	}
 
 	return msg, nil

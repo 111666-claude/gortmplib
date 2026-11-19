@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,6 +23,7 @@ import (
 	"github.com/bluenviron/gortmplib/pkg/codecs"
 	"github.com/bluenviron/gortmplib/pkg/liberrors"
 	"github.com/bluenviron/gortmplib/pkg/message"
+	"github.com/bluenviron/gortmplib/pkg/rawmessage"
 )
 
 var testCodecH264 = &codecs.H264{
@@ -2568,4 +2571,903 @@ func TestReaderUnpublish(t *testing.T) {
 			require.EqualError(t, err, "stream unpublished")
 		})
 	}
+}
+
+// dataEvent is an event received by OnDataAMF0 / OnDataAMF0Raw.
+type dataEvent struct {
+	timestamp time.Duration
+	name      string
+	value     any
+	payload   amf0.Data
+}
+
+func TestReaderDataAMF0(t *testing.T) {
+	messages := []message.Message{
+		&message.DataAMF0{
+			ChunkStreamID:   4,
+			MessageStreamID: 0x1000000,
+			Payload: []any{
+				"@setDataFrame",
+				"onMetaData",
+				amf0.Object{
+					{Key: "videocodecid", Value: float64(message.CodecH264)},
+				},
+			},
+		},
+		&message.Video{
+			ChunkStreamID:   message.VideoChunkStreamID,
+			MessageStreamID: 0x1000000,
+			Codec:           message.CodecH264,
+			FrameType:       message.VideoFrameTypeKeyFrame,
+			PacketType:      message.VideoPacketTypeConfig,
+			AVCConfig:       generateAvcC(t, testCodecH264.SPS, testCodecH264.PPS),
+		},
+		&message.Audio{
+			ChunkStreamID:   message.AudioChunkStreamID,
+			MessageStreamID: 0x1000000,
+			Codec:           message.CodecMPEG4Audio,
+			Rate:            message.AudioRate44100,
+			Depth:           message.AudioDepth16,
+			IsStereo:        true,
+			AACType:         message.AudioAACTypeConfig,
+			AACConfig: &mpeg4audio.AudioSpecificConfig{
+				Type:          mpeg4audio.ObjectTypeAACLC,
+				SampleRate:    44100,
+				ChannelConfig: 2,
+				ChannelCount:  2, //nolint:staticcheck
+			},
+		},
+		&message.Video{
+			ChunkStreamID:   message.VideoChunkStreamID,
+			DTS:             1 * time.Second,
+			MessageStreamID: 0x1000000,
+			Codec:           message.CodecH264,
+			FrameType:       message.VideoFrameTypeKeyFrame,
+			PacketType:      message.VideoPacketTypeAU,
+			AU:              []byte{0x00, 0x00, 0x00, 0x02, 0x09, 0xf0},
+		},
+		&message.DataAMF0{
+			ChunkStreamID:   4,
+			Timestamp:       1500 * time.Millisecond,
+			MessageStreamID: 0x1000000,
+			Payload: []any{
+				"nowPlaying",
+				amf0.Object{
+					{Key: "title", Value: "second track"},
+				},
+			},
+		},
+		&message.Audio{
+			ChunkStreamID:   message.AudioChunkStreamID,
+			DTS:             1800 * time.Millisecond,
+			MessageStreamID: 0x1000000,
+			Codec:           message.CodecMPEG4Audio,
+			Rate:            message.AudioRate44100,
+			Depth:           message.AudioDepth16,
+			IsStereo:        true,
+			AACType:         message.AudioAACTypeAU,
+			AU:              []byte{1, 2},
+		},
+		&message.DataAMF0{
+			ChunkStreamID:   4,
+			Timestamp:       2500 * time.Millisecond,
+			MessageStreamID: 0x1000000,
+			Payload: []any{
+				"@setDataFrame",
+				"onMetaData",
+				amf0.Object{
+					{Key: "title", Value: "third track"},
+				},
+			},
+		},
+		&message.Audio{
+			ChunkStreamID:   message.AudioChunkStreamID,
+			DTS:             2800 * time.Millisecond,
+			MessageStreamID: 0x1000000,
+			Codec:           message.CodecMPEG4Audio,
+			Rate:            message.AudioRate44100,
+			Depth:           message.AudioDepth16,
+			IsStereo:        true,
+			AACType:         message.AudioAACTypeAU,
+			AU:              []byte{3, 4},
+		},
+	}
+
+	var buf bytes.Buffer
+	bc := bytecounter.NewReadWriter(&buf)
+	mrw := message.NewReadWriter(bc, bc, true)
+
+	for _, msg := range messages {
+		err := mrw.Write(msg)
+		require.NoError(t, err)
+	}
+
+	c := &dummyConn{rw: &buf}
+	c.initialize()
+
+	r := &gortmplib.Reader{Conn: c}
+	err := r.Initialize()
+	require.NoError(t, err)
+
+	var events []dataEvent
+	var rawEvents []dataEvent
+
+	r.OnDataAMF0(func(timestamp time.Duration, name string, value any) {
+		events = append(events, dataEvent{timestamp: timestamp, name: name, value: value})
+	})
+	r.OnDataAMF0Raw(func(timestamp time.Duration, payload amf0.Data) {
+		rawEvents = append(rawEvents, dataEvent{timestamp: timestamp, payload: payload})
+	})
+	r.OnDataH264(r.Tracks()[0], func(_ time.Duration, _ time.Duration, _ [][]byte) {})
+	r.OnDataMPEG4Audio(r.Tracks()[1], func(_ time.Duration, _ []byte) {})
+
+	for {
+		err = r.Read()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		require.NoError(t, err)
+	}
+
+	// the initial onMetaData is replayed after Initialize() and delivered
+	// first, followed by the events written during the stream.
+	require.Equal(t, []dataEvent{
+		{
+			timestamp: 0,
+			name:      "onMetaData",
+			value: amf0.Object{
+				{Key: "videocodecid", Value: float64(message.CodecH264)},
+			},
+		},
+		{
+			timestamp: 1500 * time.Millisecond,
+			name:      "nowPlaying",
+			value: amf0.Object{
+				{Key: "title", Value: "second track"},
+			},
+		},
+		{
+			timestamp: 2500 * time.Millisecond,
+			name:      "onMetaData",
+			value: amf0.Object{
+				{Key: "title", Value: "third track"},
+			},
+		},
+	}, events)
+
+	require.Equal(t, []dataEvent{
+		{
+			timestamp: 0,
+			payload: amf0.Data{
+				"@setDataFrame",
+				"onMetaData",
+				amf0.Object{
+					{Key: "videocodecid", Value: float64(message.CodecH264)},
+				},
+			},
+		},
+		{
+			timestamp: 1500 * time.Millisecond,
+			payload: amf0.Data{
+				"nowPlaying",
+				amf0.Object{
+					{Key: "title", Value: "second track"},
+				},
+			},
+		},
+		{
+			timestamp: 2500 * time.Millisecond,
+			payload: amf0.Data{
+				"@setDataFrame",
+				"onMetaData",
+				amf0.Object{
+					{Key: "title", Value: "third track"},
+				},
+			},
+		},
+	}, rawEvents)
+}
+
+func TestReaderDataAMF0RoundTrip(t *testing.T) {
+	// use the writer to send two updates and verify that the reader receives
+	// them with the same content, in the same order.
+	var pipe serverConnPipe
+	pipe.initialize(t)
+
+	tracks := []*gortmplib.Track{{Codec: testCodecH264}}
+
+	updates := []struct {
+		timestamp time.Duration
+		metadata  amf0.Object
+	}{
+		{
+			1 * time.Second,
+			amf0.Object{
+				{Key: "title", Value: "second track"},
+				{Key: "artist", Value: "artist 2"},
+				{Key: "released", Value: true},
+				{Key: "duration", Value: float64(180)},
+				{Key: "tags", Value: amf0.StrictArray{"a", "b"}},
+			},
+		},
+		{
+			2 * time.Second,
+			amf0.Object{
+				{Key: "title", Value: "third track"},
+				{Key: "nested", Value: amf0.Object{
+					{Key: "key", Value: "value"},
+				}},
+			},
+		},
+	}
+
+	writeDone := make(chan error, 1)
+	go func() {
+		w := &gortmplib.Writer{
+			Conn:   pipe.writerConn,
+			Tracks: tracks,
+		}
+		err := w.Initialize()
+		if err != nil {
+			writeDone <- err
+			return
+		}
+
+		// video frames are needed to let the reader complete its analysis.
+		au := [][]byte{{byte(h264.NALUTypeIDR), 0x01}}
+		err = w.WriteH264(tracks[0], 0, 0, au)
+		if err != nil {
+			writeDone <- err
+			return
+		}
+
+		for _, update := range updates {
+			err = w.WriteMetadata(update.timestamp, update.metadata)
+			if err != nil {
+				writeDone <- err
+				return
+			}
+		}
+
+		err = w.WriteH264(tracks[0], 3*time.Second, 3*time.Second, au)
+		if err != nil {
+			writeDone <- err
+			return
+		}
+
+		writeDone <- w.Wait()
+	}()
+
+	r := &gortmplib.Reader{Conn: pipe.readerConn}
+	err := r.Initialize()
+	require.NoError(t, err)
+
+	var events []dataEvent
+	r.OnDataAMF0(func(timestamp time.Duration, name string, value any) {
+		events = append(events, dataEvent{timestamp: timestamp, name: name, value: value})
+	})
+	r.OnDataH264(r.Tracks()[0], func(_ time.Duration, _ time.Duration, _ [][]byte) {})
+
+	// the initial onMetaData is replayed by Initialize(), followed by updates.
+	for len(events) < 1+len(updates) {
+		err = r.Read()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		require.NoError(t, err)
+	}
+
+	require.Len(t, events, 1+len(updates))
+
+	// the initial metadata is not modified by the updates
+	require.Equal(t, "onMetaData", events[0].name)
+	require.IsType(t, amf0.Object{}, events[0].value)
+
+	for i, update := range updates {
+		require.Equal(t, update.timestamp, events[i+1].timestamp)
+		require.Equal(t, "onMetaData", events[i+1].name)
+		require.Equal(t, update.metadata, events[i+1].value)
+	}
+
+	// close the reader side; the writer reports the disconnection
+	pipe.closeAll()
+	require.Error(t, <-writeDone)
+}
+
+func TestReaderDataAMF0TimestampWrap(t *testing.T) {
+	const wrap = time.Duration(1<<32) * time.Millisecond
+
+	messages := []message.Message{
+		&message.Video{
+			ChunkStreamID:   message.VideoChunkStreamID,
+			MessageStreamID: 0x1000000,
+			Codec:           message.CodecH264,
+			FrameType:       message.VideoFrameTypeKeyFrame,
+			PacketType:      message.VideoPacketTypeConfig,
+			AVCConfig:       generateAvcC(t, testCodecH264.SPS, testCodecH264.PPS),
+		},
+		&message.Video{
+			ChunkStreamID:   message.VideoChunkStreamID,
+			DTS:             2 * time.Second,
+			MessageStreamID: 0x1000000,
+			Codec:           message.CodecH264,
+			FrameType:       message.VideoFrameTypeKeyFrame,
+			PacketType:      message.VideoPacketTypeAU,
+			AU:              []byte{0x00, 0x00, 0x00, 0x02, 0x09, 0xf0},
+		},
+		&message.DataAMF0{
+			ChunkStreamID:   4,
+			Timestamp:       wrap - 1000*time.Millisecond,
+			MessageStreamID: 0x1000000,
+			Payload:         []any{"event", float64(1)},
+		},
+		&message.DataAMF0{
+			ChunkStreamID:   4,
+			Timestamp:       500 * time.Millisecond,
+			MessageStreamID: 0x1000000,
+			Payload:         []any{"event", float64(2)},
+		},
+		&message.DataAMF0{
+			ChunkStreamID:   4,
+			Timestamp:       1500 * time.Millisecond,
+			MessageStreamID: 0x1000000,
+			Payload:         []any{"event", float64(3)},
+		},
+		&message.DataAMF0{
+			ChunkStreamID:   4,
+			Timestamp:       wrap + 1000*time.Millisecond,
+			MessageStreamID: 0x1000000,
+			Payload:         []any{"event", float64(4)},
+		},
+	}
+
+	var buf bytes.Buffer
+	bc := bytecounter.NewReadWriter(&buf)
+	mrw := message.NewReadWriter(bc, bc, true)
+
+	for _, msg := range messages {
+		err := mrw.Write(msg)
+		require.NoError(t, err)
+	}
+
+	c := &dummyConn{rw: &buf}
+	c.initialize()
+
+	r := &gortmplib.Reader{Conn: c}
+	err := r.Initialize()
+	require.NoError(t, err)
+
+	var timestamps []time.Duration
+	r.OnDataAMF0(func(timestamp time.Duration, _ string, _ any) {
+		timestamps = append(timestamps, timestamp)
+	})
+	r.OnDataH264(r.Tracks()[0], func(_ time.Duration, _ time.Duration, _ [][]byte) {})
+
+	for {
+		err = r.Read()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		require.NoError(t, err)
+	}
+
+	require.Equal(t, []time.Duration{
+		wrap - 1000*time.Millisecond,
+		wrap + 500*time.Millisecond,
+		wrap + 1500*time.Millisecond,
+		wrap + 1000*time.Millisecond,
+	}, timestamps)
+}
+
+func TestReaderDataAMF0Duplicates(t *testing.T) {
+	messages := []message.Message{
+		&message.Video{
+			ChunkStreamID:   message.VideoChunkStreamID,
+			MessageStreamID: 0x1000000,
+			Codec:           message.CodecH264,
+			FrameType:       message.VideoFrameTypeKeyFrame,
+			PacketType:      message.VideoPacketTypeConfig,
+			AVCConfig:       generateAvcC(t, testCodecH264.SPS, testCodecH264.PPS),
+		},
+		&message.Video{
+			ChunkStreamID:   message.VideoChunkStreamID,
+			DTS:             2 * time.Second,
+			MessageStreamID: 0x1000000,
+			Codec:           message.CodecH264,
+			FrameType:       message.VideoFrameTypeKeyFrame,
+			PacketType:      message.VideoPacketTypeAU,
+			AU:              []byte{0x00, 0x00, 0x00, 0x02, 0x09, 0xf0},
+		},
+		&message.DataAMF0{
+			ChunkStreamID:   4,
+			Timestamp:       3 * time.Second,
+			MessageStreamID: 0x1000000,
+			Payload:         []any{"event", "same"},
+		},
+		&message.DataAMF0{
+			ChunkStreamID:   4,
+			Timestamp:       3 * time.Second,
+			MessageStreamID: 0x1000000,
+			Payload:         []any{"event", "same"},
+		},
+	}
+
+	var buf bytes.Buffer
+	bc := bytecounter.NewReadWriter(&buf)
+	mrw := message.NewReadWriter(bc, bc, true)
+
+	for _, msg := range messages {
+		err := mrw.Write(msg)
+		require.NoError(t, err)
+	}
+
+	c := &dummyConn{rw: &buf}
+	c.initialize()
+
+	r := &gortmplib.Reader{Conn: c}
+	err := r.Initialize()
+	require.NoError(t, err)
+
+	count := 0
+	r.OnDataAMF0(func(_ time.Duration, _ string, _ any) {
+		count++
+	})
+	r.OnDataH264(r.Tracks()[0], func(_ time.Duration, _ time.Duration, _ [][]byte) {})
+
+	for {
+		err = r.Read()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		require.NoError(t, err)
+	}
+
+	// duplicate events are distinct messages and must all be delivered
+	require.Equal(t, 2, count)
+}
+
+func TestReaderDataAMF0BadAMF(t *testing.T) {
+	// craft a buffered connection containing a valid video track followed by
+	// a data message with an invalid AMF0 payload.
+	var buf bytes.Buffer
+	bc := bytecounter.NewReadWriter(&buf)
+	mrw := message.NewReadWriter(bc, bc, true)
+
+	err := mrw.Write(&message.Video{
+		ChunkStreamID:   message.VideoChunkStreamID,
+		MessageStreamID: 0x1000000,
+		Codec:           message.CodecH264,
+		FrameType:       message.VideoFrameTypeKeyFrame,
+		PacketType:      message.VideoPacketTypeConfig,
+		AVCConfig:       generateAvcC(t, testCodecH264.SPS, testCodecH264.PPS),
+	})
+	require.NoError(t, err)
+
+	err = mrw.Write(&message.Video{
+		ChunkStreamID:   message.VideoChunkStreamID,
+		DTS:             2 * time.Second,
+		MessageStreamID: 0x1000000,
+		Codec:           message.CodecH264,
+		FrameType:       message.VideoFrameTypeKeyFrame,
+		PacketType:      message.VideoPacketTypeAU,
+		AU:              []byte{0x00, 0x00, 0x00, 0x02, 0x09, 0xf0},
+	})
+	require.NoError(t, err)
+
+	// write the raw data message, so that the invalid payload is preserved
+	rw := &rawmessage.Writer{
+		BW:  bc.Writer,
+		BCW: bc.Writer,
+	}
+	rw.Initialize()
+
+	err = rw.Write(&rawmessage.Message{
+		ChunkStreamID:   4,
+		Timestamp:       3 * time.Second,
+		Type:            uint8(message.TypeDataAMF0),
+		MessageStreamID: 0x1000000,
+		Body:            []byte{0xFF},
+	})
+	require.NoError(t, err)
+
+	c := &dummyConn{rw: &buf}
+	c.initialize()
+
+	r := &gortmplib.Reader{Conn: c}
+	err = r.Initialize()
+	require.NoError(t, err)
+
+	delivered := false
+	r.OnDataAMF0(func(_ time.Duration, _ string, _ any) {
+		delivered = true
+	})
+	r.OnDataH264(r.Tracks()[0], func(_ time.Duration, _ time.Duration, _ [][]byte) {})
+
+	// the configuration and the first access unit are replayed by Initialize()
+	err = r.Read()
+	require.NoError(t, err)
+
+	err = r.Read()
+	require.NoError(t, err)
+
+	// the invalid AMF payload is reported and the event is not delivered
+	err = r.Read()
+	require.EqualError(t, err, "unsupported marker 0xff")
+	require.False(t, delivered)
+}
+
+func TestReaderDataAMF0NoConsumer(t *testing.T) {
+	messages := []message.Message{
+		&message.Video{
+			ChunkStreamID:   message.VideoChunkStreamID,
+			MessageStreamID: 0x1000000,
+			Codec:           message.CodecH264,
+			FrameType:       message.VideoFrameTypeKeyFrame,
+			PacketType:      message.VideoPacketTypeConfig,
+			AVCConfig:       generateAvcC(t, testCodecH264.SPS, testCodecH264.PPS),
+		},
+		&message.Video{
+			ChunkStreamID:   message.VideoChunkStreamID,
+			DTS:             2 * time.Second,
+			MessageStreamID: 0x1000000,
+			Codec:           message.CodecH264,
+			FrameType:       message.VideoFrameTypeKeyFrame,
+			PacketType:      message.VideoPacketTypeAU,
+			AU:              []byte{0x00, 0x00, 0x00, 0x02, 0x09, 0xf0},
+		},
+		&message.DataAMF0{
+			ChunkStreamID:   4,
+			Timestamp:       3 * time.Second,
+			MessageStreamID: 0x1000000,
+			Payload:         []any{"event", "value"},
+		},
+		&message.Video{
+			ChunkStreamID:   message.VideoChunkStreamID,
+			DTS:             4 * time.Second,
+			MessageStreamID: 0x1000000,
+			Codec:           message.CodecH264,
+			FrameType:       message.VideoFrameTypeInterFrame,
+			PacketType:      message.VideoPacketTypeAU,
+			AU:              []byte{0x00, 0x00, 0x00, 0x02, 0x09, 0xf0},
+		},
+	}
+
+	var buf bytes.Buffer
+	bc := bytecounter.NewReadWriter(&buf)
+	mrw := message.NewReadWriter(bc, bc, true)
+
+	for _, msg := range messages {
+		err := mrw.Write(msg)
+		require.NoError(t, err)
+	}
+
+	c := &dummyConn{rw: &buf}
+	c.initialize()
+
+	r := &gortmplib.Reader{Conn: c}
+	err := r.Initialize()
+	require.NoError(t, err)
+
+	// no data consumer: data events are skipped without errors
+	received := 0
+	r.OnDataH264(r.Tracks()[0], func(_ time.Duration, _ time.Duration, _ [][]byte) {
+		received++
+	})
+
+	for {
+		err = r.Read()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		require.NoError(t, err)
+	}
+
+	// the configuration message is delivered as well
+	require.Equal(t, 3, received)
+}
+
+func TestReaderDataAMF0Shape(t *testing.T) {
+	for _, ca := range []struct {
+		name          string
+		payload       amf0.Data
+		expectedName  string
+		expectedValue any
+	}{
+		{
+			"onMetaData",
+			amf0.Data{"onMetaData", amf0.Object{{Key: "a", Value: "b"}}},
+			"onMetaData",
+			amf0.Object{{Key: "a", Value: "b"}},
+		},
+		{
+			"setDataFrame",
+			amf0.Data{"@setDataFrame", "onMetaData", amf0.Object{{Key: "a", Value: "b"}}},
+			"onMetaData",
+			amf0.Object{{Key: "a", Value: "b"}},
+		},
+		{
+			"single string",
+			amf0.Data{"name-only"},
+			"name-only",
+			nil,
+		},
+		{
+			"name and value",
+			amf0.Data{"name", float64(1)},
+			"name",
+			float64(1),
+		},
+		{
+			"non-string name",
+			amf0.Data{float64(1), "value"},
+			"",
+			"value",
+		},
+		{
+			"empty",
+			amf0.Data{},
+			"",
+			nil,
+		},
+		{
+			"ECMA array metadata",
+			amf0.Data{"onMetaData", amf0.ECMAArray{{Key: "a", Value: "b"}}},
+			"onMetaData",
+			amf0.ECMAArray{{Key: "a", Value: "b"}},
+		},
+		{
+			"long string value",
+			amf0.Data{"onMetaData", amf0.Object{
+				{Key: "title", Value: strings.Repeat("a", 0x10000)},
+			}},
+			"onMetaData",
+			amf0.Object{
+				{Key: "title", Value: strings.Repeat("a", 0x10000)},
+			},
+		},
+	} {
+		t.Run(ca.name, func(t *testing.T) {
+			messages := []message.Message{
+				&message.Video{
+					ChunkStreamID:   message.VideoChunkStreamID,
+					MessageStreamID: 0x1000000,
+					Codec:           message.CodecH264,
+					FrameType:       message.VideoFrameTypeKeyFrame,
+					PacketType:      message.VideoPacketTypeConfig,
+					AVCConfig:       generateAvcC(t, testCodecH264.SPS, testCodecH264.PPS),
+				},
+				&message.Video{
+					ChunkStreamID:   message.VideoChunkStreamID,
+					DTS:             2 * time.Second,
+					MessageStreamID: 0x1000000,
+					Codec:           message.CodecH264,
+					FrameType:       message.VideoFrameTypeKeyFrame,
+					PacketType:      message.VideoPacketTypeAU,
+					AU:              []byte{0x00, 0x00, 0x00, 0x02, 0x09, 0xf0},
+				},
+				&message.DataAMF0{
+					ChunkStreamID:   4,
+					MessageStreamID: 0x1000000,
+					Payload:         ca.payload,
+				},
+			}
+
+			var buf bytes.Buffer
+			bc := bytecounter.NewReadWriter(&buf)
+			mrw := message.NewReadWriter(bc, bc, true)
+
+			for _, msg := range messages {
+				err := mrw.Write(msg)
+				require.NoError(t, err)
+			}
+
+			c := &dummyConn{rw: &buf}
+			c.initialize()
+
+			r := &gortmplib.Reader{Conn: c}
+			err := r.Initialize()
+			require.NoError(t, err)
+
+			var events []dataEvent
+			r.OnDataAMF0(func(timestamp time.Duration, name string, value any) {
+				events = append(events, dataEvent{timestamp: timestamp, name: name, value: value})
+			})
+			r.OnDataH264(r.Tracks()[0], func(_ time.Duration, _ time.Duration, _ [][]byte) {})
+
+			for {
+				err = r.Read()
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				require.NoError(t, err)
+			}
+
+			// only data events are collected by this callback
+			require.Equal(t, []dataEvent{
+				{timestamp: 0, name: ca.expectedName, value: ca.expectedValue},
+			}, events)
+		})
+	}
+}
+
+// serverConnPipe is a pair of connections connected to each other.
+type serverConnPipe struct {
+	writerConn *dummyConn
+	readerConn *dummyConn
+	server     net.Conn
+	client     net.Conn
+}
+
+func (p *serverConnPipe) initialize(t *testing.T) {
+	t.Helper()
+
+	var err error
+	p.server, p.client = net.Pipe()
+	require.NoError(t, err)
+
+	p.writerConn = &dummyConn{rw: p.server}
+	p.writerConn.initialize()
+
+	p.readerConn = &dummyConn{rw: p.client}
+	p.readerConn.initialize()
+}
+
+func (p *serverConnPipe) closeAll() {
+	p.server.Close()
+	p.client.Close()
+}
+
+func TestReaderDataAMF0RawPreservesExtraElements(t *testing.T) {
+	payload := amf0.Data{
+		"custom",
+		"first",
+		"second",
+		float64(3),
+	}
+
+	messages := []message.Message{
+		&message.Video{
+			ChunkStreamID:   message.VideoChunkStreamID,
+			MessageStreamID: 0x1000000,
+			Codec:           message.CodecH264,
+			FrameType:       message.VideoFrameTypeKeyFrame,
+			PacketType:      message.VideoPacketTypeConfig,
+			AVCConfig:       generateAvcC(t, testCodecH264.SPS, testCodecH264.PPS),
+		},
+		&message.Video{
+			ChunkStreamID:   message.VideoChunkStreamID,
+			DTS:             2 * time.Second,
+			MessageStreamID: 0x1000000,
+			Codec:           message.CodecH264,
+			FrameType:       message.VideoFrameTypeKeyFrame,
+			PacketType:      message.VideoPacketTypeAU,
+			AU:              []byte{0x00, 0x00, 0x00, 0x02, 0x09, 0xf0},
+		},
+		&message.DataAMF0{
+			ChunkStreamID:   4,
+			Timestamp:       3 * time.Second,
+			MessageStreamID: 0x1000000,
+			Payload:         payload,
+		},
+	}
+
+	var buf bytes.Buffer
+	bc := bytecounter.NewReadWriter(&buf)
+	mrw := message.NewReadWriter(bc, bc, true)
+
+	for _, msg := range messages {
+		err := mrw.Write(msg)
+		require.NoError(t, err)
+	}
+
+	c := &dummyConn{rw: &buf}
+	c.initialize()
+
+	r := &gortmplib.Reader{Conn: c}
+	err := r.Initialize()
+	require.NoError(t, err)
+
+	var rawPayloads []amf0.Data
+	var normalizedEvents []dataEvent
+
+	r.OnDataAMF0Raw(func(_ time.Duration, payload amf0.Data) {
+		rawPayloads = append(rawPayloads, payload)
+	})
+	r.OnDataAMF0(func(timestamp time.Duration, name string, value any) {
+		normalizedEvents = append(normalizedEvents, dataEvent{timestamp: timestamp, name: name, value: value})
+	})
+	r.OnDataH264(r.Tracks()[0], func(_ time.Duration, _ time.Duration, _ [][]byte) {})
+
+	for {
+		err = r.Read()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		require.NoError(t, err)
+	}
+
+	// the raw callback receives every element...
+	require.Equal(t, []amf0.Data{payload}, rawPayloads)
+
+	// ...while the normalized callback receives only name and value.
+	require.Equal(t, []dataEvent{
+		{timestamp: 3 * time.Second, name: "custom", value: "first"},
+	}, normalizedEvents)
+}
+
+func TestReaderDataAMF0VideoExMetadata(t *testing.T) {
+	messages := []message.Message{
+		&message.Video{
+			ChunkStreamID:   message.VideoChunkStreamID,
+			MessageStreamID: 0x1000000,
+			Codec:           message.CodecH264,
+			FrameType:       message.VideoFrameTypeKeyFrame,
+			PacketType:      message.VideoPacketTypeConfig,
+			AVCConfig:       generateAvcC(t, testCodecH264.SPS, testCodecH264.PPS),
+		},
+		&message.Video{
+			ChunkStreamID:   message.VideoChunkStreamID,
+			DTS:             2 * time.Second,
+			MessageStreamID: 0x1000000,
+			Codec:           message.CodecH264,
+			FrameType:       message.VideoFrameTypeKeyFrame,
+			PacketType:      message.VideoPacketTypeAU,
+			AU:              []byte{0x00, 0x00, 0x00, 0x02, 0x09, 0xf0},
+		},
+		&message.VideoExMetadata{
+			ChunkStreamID:   message.VideoChunkStreamID,
+			DTS:             3 * time.Second,
+			MessageStreamID: 0x1000000,
+			FourCC:          message.FourCCHEVC,
+			Payload: []any{
+				"colorInfo",
+				amf0.Object{{Key: "colorConfig", Value: amf0.Object{}}},
+			},
+		},
+	}
+
+	var buf bytes.Buffer
+	bc := bytecounter.NewReadWriter(&buf)
+	mrw := message.NewReadWriter(bc, bc, true)
+
+	for _, msg := range messages {
+		err := mrw.Write(msg)
+		require.NoError(t, err)
+	}
+
+	c := &dummyConn{rw: &buf}
+	c.initialize()
+
+	r := &gortmplib.Reader{Conn: c}
+	err := r.Initialize()
+	require.NoError(t, err)
+
+	var rawPayloads []amf0.Data
+	var normalized []dataEvent
+
+	r.OnDataAMF0Raw(func(_ time.Duration, payload amf0.Data) {
+		rawPayloads = append(rawPayloads, payload)
+	})
+	r.OnDataAMF0(func(timestamp time.Duration, name string, value any) {
+		normalized = append(normalized, dataEvent{timestamp: timestamp, name: name, value: value})
+	})
+	r.OnDataH264(r.Tracks()[0], func(_ time.Duration, _ time.Duration, _ [][]byte) {})
+
+	for {
+		err = r.Read()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		require.NoError(t, err)
+	}
+
+	expectedPayload := amf0.Data{
+		"colorInfo",
+		amf0.Object{{Key: "colorConfig", Value: amf0.Object{}}},
+	}
+
+	require.Equal(t, []amf0.Data{expectedPayload}, rawPayloads)
+	require.Equal(t, []dataEvent{
+		{timestamp: 3 * time.Second, name: "colorInfo", value: expectedPayload[1]},
+	}, normalized)
 }

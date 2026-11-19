@@ -12,6 +12,7 @@ import (
 	"github.com/bluenviron/mediacommon/v2/pkg/codecs/h264"
 	"github.com/bluenviron/mediacommon/v2/pkg/codecs/h265"
 
+	"github.com/bluenviron/gortmplib/pkg/amf0"
 	"github.com/bluenviron/gortmplib/pkg/codecs"
 	"github.com/bluenviron/gortmplib/pkg/liberrors"
 	"github.com/bluenviron/gortmplib/pkg/message"
@@ -19,6 +20,12 @@ import (
 
 const (
 	analyzePeriod = 2 * time.Second
+
+	// RTMP timestamps are 32-bit milliseconds and wrap around every
+	// 2^32 milliseconds (about 49.7 days). Timed data events are extended
+	// to a 64-bit timestamp when they cross this boundary, so that callbacks
+	// always receive timestamps in time order.
+	dataTimestampWrap = time.Duration(1<<32) * time.Millisecond
 )
 
 // OnDataAV1Func is the prototype of the callback passed to OnDataAV1().
@@ -60,6 +67,19 @@ type OnDataG711Func func(pts time.Duration, samples []byte)
 // OnDataLPCMFunc is the prototype of the callback passed to OnDataLPCM().
 // samples is guaranteed to contain at least 1 byte.
 type OnDataLPCMFunc func(pts time.Duration, samples []byte)
+
+// OnDataAMF0Func is the prototype of the callback passed to OnDataAMF0().
+// timestamp is the media time the event refers to, expressed in milliseconds.
+// name and value are the name and the value of the event.
+// Standard events such as ["onMetaData", value] and
+// ["@setDataFrame", "onMetaData", value] are delivered with name "onMetaData"
+// and value set to the metadata object.
+type OnDataAMF0Func func(timestamp time.Duration, name string, value any)
+
+// OnDataAMF0RawFunc is the prototype of the callback passed to OnDataAMF0Raw().
+// It is called for every AMF0 data message, without any normalization, so that
+// non-standard events can be received and forwarded without losing content.
+type OnDataAMF0RawFunc func(timestamp time.Duration, payload amf0.Data)
 
 func h265FindParams(hvcc *mp4.HvcC) ([]byte, []byte, []byte, error) {
 	var vps []byte
@@ -287,6 +307,12 @@ type Reader struct {
 	onVideoData          map[uint8]func(message.Message) error
 	onVideoDataFinalizer map[uint8]func()
 	onAudioData          map[uint8]func(message.Message) error
+	onDataAMF0           OnDataAMF0Func
+	onDataAMF0Raw        OnDataAMF0RawFunc
+
+	// extended timestamp of the last data event, used to handle wrap-around
+	lastDataTimestamp    time.Duration
+	lastDataTimestampSet bool
 }
 
 // Initialize initializes Reader.
@@ -915,6 +941,118 @@ func (r *Reader) OnDataLPCM(track *Track, cb OnDataLPCMFunc) {
 	}
 }
 
+// OnDataAMF0 sets a callback that is called when an AMF0 data event is received.
+//
+// Standard metadata events, i.e. ["onMetaData", value] and
+// ["@setDataFrame", "onMetaData", value], are delivered with name "onMetaData"
+// and value set to the metadata object. The value can be an amf0.Object or an
+// amf0.ECMAArray, depending on what the publisher sent.
+//
+// Events with a different shape are delivered with name set to the first
+// string element and value set to the second element, if present; otherwise
+// name is empty and value is nil. Use OnDataAMF0Raw() to receive them without
+// any normalization.
+// If the same message contains additional elements after the name and value,
+// they are not delivered: use OnDataAMF0Raw() to receive them.
+//
+// The callback is called in the same goroutine of Read(), in the same order in
+// which events appear in the stream, hence interleaving with audio and video
+// data is preserved.
+//
+// Every data message is delivered exactly once, in stream order: duplicated
+// events are not removed, since they are distinct messages and may carry
+// different timestamps.
+//
+// The initial onMetaData message sent by the publisher is delivered as well:
+// messages read by Initialize() are replayed, so that a republishing
+// implementation does not lose it.
+func (r *Reader) OnDataAMF0(cb OnDataAMF0Func) {
+	r.onDataAMF0 = cb
+}
+
+// OnDataAMF0Raw sets a callback that is called for every AMF0 data event,
+// with the payload as it was received. Contrary to OnDataAMF0(), no
+// normalization is applied and no element is discarded.
+//
+// The callback is called in the same goroutine of Read() and in stream order.
+// Every data message is delivered exactly once; duplicated events are not
+// removed.
+//
+// The initial onMetaData message sent by the publisher is delivered as well:
+// messages read by Initialize() are replayed.
+func (r *Reader) OnDataAMF0Raw(cb OnDataAMF0RawFunc) {
+	r.onDataAMF0Raw = cb
+}
+
+func amf0PayloadToEvent(payload amf0.Data) (string, any) {
+	if len(payload) == 0 {
+		return "", nil
+	}
+
+	name, _ := payload[0].(string)
+
+	// ["@setDataFrame", "onMetaData", value]
+	if name == "@setDataFrame" {
+		if len(payload) < 2 {
+			return "", nil
+		}
+
+		innerName, _ := payload[1].(string)
+		if len(payload) < 3 {
+			return innerName, nil
+		}
+
+		return innerName, payload[2]
+	}
+
+	// ["onMetaData", value]
+	if len(payload) < 2 {
+		return name, nil
+	}
+
+	return name, payload[1]
+}
+
+// extendDataTimestamp converts the 32-bit timestamp of a data event into a
+// monotonically increasing 64-bit timestamp, by detecting wrap-arounds.
+// Events whose timestamp goes backward without crossing the wrap boundary
+// (which can happen when a publisher writes them out of order) are returned
+// unchanged.
+func (r *Reader) extendDataTimestamp(v time.Duration) time.Duration {
+	if !r.lastDataTimestampSet {
+		r.lastDataTimestampSet = true
+		r.lastDataTimestamp = v
+		return v
+	}
+
+	// map v into the same 2^32-millisecond period of the previous timestamp.
+	base := r.lastDataTimestamp - (r.lastDataTimestamp % dataTimestampWrap)
+	v += base
+
+	// if the resulting timestamp is too far in the past, the counter wrapped
+	// around and the event belongs to the following period.
+	if v < (r.lastDataTimestamp - dataTimestampWrap/2) {
+		v += dataTimestampWrap
+	}
+
+	r.lastDataTimestamp = v
+	return v
+}
+
+// processDataAMF0 delivers an AMF0 data event to the registered callbacks.
+func (r *Reader) processDataAMF0(timestamp time.Duration, payload amf0.Data) {
+	timestamp = r.extendDataTimestamp(timestamp)
+
+	if r.onDataAMF0Raw != nil {
+		r.onDataAMF0Raw(timestamp, payload)
+	}
+
+	if r.onDataAMF0 != nil {
+		name, value := amf0PayloadToEvent(payload)
+		r.onDataAMF0(timestamp, name, value)
+	}
+}
+
 // Read reads data.
 func (r *Reader) Read() error {
 	msg, err := r.Conn.Read()
@@ -939,6 +1077,15 @@ func (r *Reader) Read() error {
 		case "FCUnpublish", "deleteStream", "closeStream":
 			return liberrors.ErrReaderUnpublished{}
 		}
+
+	case *message.DataAMF0:
+		r.processDataAMF0(msg.Timestamp, msg.Payload)
+		return nil
+
+	case *message.VideoExMetadata:
+		// Enhanced RTMP video metadata is a timed metadata event as well.
+		r.processDataAMF0(msg.DTS, msg.Payload)
+		return nil
 
 	case *message.Video, *message.VideoExCodedFrames, *message.VideoExFramesX:
 		if r.videoTracks[0] == nil {

@@ -27,6 +27,13 @@ const (
 	markerTypedObject = 0x10
 )
 
+const (
+	// maximum nesting level of objects and arrays.
+	// it prevents unbounded recursion (and stack exhaustion) with
+	// malicious or cyclic inputs.
+	maxDepth = 64
+)
+
 var errBufferTooShort = errors.New("buffer is too short")
 
 // Data is a list of ActionScript object graphs.
@@ -43,12 +50,16 @@ type Data []any
 
 // Unmarshal decodes AMF0 data.
 func Unmarshal(buf []byte) (Data, error) {
+	return unmarshalData(buf, 0)
+}
+
+func unmarshalData(buf []byte, depth int) (Data, error) {
 	var out Data
 
 	for len(buf) != 0 {
 		var item any
 		var err error
-		item, buf, err = unmarshal(buf)
+		item, buf, err = unmarshal(buf, depth)
 		if err != nil {
 			return nil, err
 		}
@@ -59,7 +70,11 @@ func Unmarshal(buf []byte) (Data, error) {
 	return out, nil
 }
 
-func unmarshal(buf []byte) (any, []byte, error) {
+func unmarshal(buf []byte, depth int) (any, []byte, error) {
+	if depth > maxDepth {
+		return nil, nil, fmt.Errorf("maximum nesting level (%d) exceeded", maxDepth)
+	}
+
 	if len(buf) < 1 {
 		return nil, nil, errBufferTooShort
 	}
@@ -97,6 +112,20 @@ func unmarshal(buf []byte) (any, []byte, error) {
 
 		return string(buf[:le]), buf[le:], nil
 
+	case markerLongString:
+		if len(buf) < 4 {
+			return nil, nil, errBufferTooShort
+		}
+
+		le := uint32(buf[0])<<24 | uint32(buf[1])<<16 | uint32(buf[2])<<8 | uint32(buf[3])
+		buf = buf[4:]
+
+		if len(buf) < int(le) {
+			return nil, nil, errBufferTooShort
+		}
+
+		return string(buf[:le]), buf[le:], nil
+
 	case markerECMAArray:
 		if len(buf) < 4 {
 			return nil, nil, errBufferTooShort
@@ -127,7 +156,7 @@ func unmarshal(buf []byte) (any, []byte, error) {
 
 			var value any
 			var err error
-			value, buf, err = unmarshal(buf)
+			value, buf, err = unmarshal(buf, depth+1)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -172,7 +201,7 @@ func unmarshal(buf []byte) (any, []byte, error) {
 
 			var value any
 			var err error
-			value, buf, err = unmarshal(buf)
+			value, buf, err = unmarshal(buf, depth+1)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -212,7 +241,7 @@ func unmarshal(buf []byte) (any, []byte, error) {
 		for i := 0; i < int(arrayCount); i++ {
 			var value any
 			var err error
-			value, buf, err = unmarshal(buf)
+			value, buf, err = unmarshal(buf, depth+1)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -248,7 +277,12 @@ func (data Data) MarshalTo(buf []byte) (int, error) {
 	n := 0
 
 	for _, item := range data {
-		n += marshalItem(item, buf[n:])
+		written, err := marshalItem(item, buf[n:], 0)
+		if err != nil {
+			return n, err
+		}
+
+		n += written
 	}
 
 	return n, nil
@@ -259,7 +293,7 @@ func (data Data) MarshalSize() (int, error) {
 	n := 0
 
 	for _, item := range data {
-		in, err := marshalSizeItem(item)
+		in, err := marshalSizeItem(item, 0)
 		if err != nil {
 			return 0, err
 		}
@@ -270,7 +304,26 @@ func (data Data) MarshalSize() (int, error) {
 	return n, nil
 }
 
-func marshalSizeItem(item any) (int, error) {
+func stringMarshalSize(v string) int {
+	// strings longer than 65535 bytes require the long string marker
+	if len(v) > 0xFFFF {
+		return 5 + len(v)
+	}
+	return 3 + len(v)
+}
+
+func checkKey(key string) error {
+	if len(key) > 0xFFFF {
+		return fmt.Errorf("object key length (%d) exceeds maximum (%d)", len(key), 0xFFFF)
+	}
+	return nil
+}
+
+func marshalSizeItem(item any, depth int) (int, error) {
+	if depth > maxDepth {
+		return 0, fmt.Errorf("maximum nesting level (%d) exceeded", maxDepth)
+	}
+
 	switch item := item.(type) {
 	case float64:
 		return 9, nil
@@ -279,13 +332,18 @@ func marshalSizeItem(item any) (int, error) {
 		return 2, nil
 
 	case string:
-		return 3 + len(item), nil
+		return stringMarshalSize(item), nil
 
 	case ECMAArray:
 		n := 5
 
 		for _, entry := range item {
-			en, err := marshalSizeItem(entry.Value)
+			err := checkKey(entry.Key)
+			if err != nil {
+				return 0, err
+			}
+
+			en, err := marshalSizeItem(entry.Value, depth+1)
 			if err != nil {
 				return 0, err
 			}
@@ -301,7 +359,12 @@ func marshalSizeItem(item any) (int, error) {
 		n := 1
 
 		for _, entry := range item {
-			en, err := marshalSizeItem(entry.Value)
+			err := checkKey(entry.Key)
+			if err != nil {
+				return 0, err
+			}
+
+			en, err := marshalSizeItem(entry.Value, depth+1)
 			if err != nil {
 				return 0, err
 			}
@@ -320,7 +383,7 @@ func marshalSizeItem(item any) (int, error) {
 		n := 5
 
 		for _, entry := range item {
-			en, err := marshalSizeItem(entry)
+			en, err := marshalSizeItem(entry, depth+1)
 			if err != nil {
 				return 0, err
 			}
@@ -338,7 +401,31 @@ func marshalSizeItem(item any) (int, error) {
 	}
 }
 
-func marshalItem(item any, buf []byte) int {
+func marshalString(item string, buf []byte) int {
+	le := len(item)
+
+	if le > 0xFFFF {
+		buf[0] = markerLongString
+		buf[1] = byte(le >> 24)
+		buf[2] = byte(le >> 16)
+		buf[3] = byte(le >> 8)
+		buf[4] = byte(le)
+		copy(buf[5:], item)
+		return 5 + le
+	}
+
+	buf[0] = markerString
+	buf[1] = byte(le >> 8)
+	buf[2] = byte(le)
+	copy(buf[3:], item)
+	return 3 + le
+}
+
+func marshalItem(item any, buf []byte, depth int) (int, error) {
+	if depth > maxDepth {
+		return 0, fmt.Errorf("maximum nesting level (%d) exceeded", maxDepth)
+	}
+
 	switch item := item.(type) {
 	case float64:
 		v := math.Float64bits(item)
@@ -351,22 +438,17 @@ func marshalItem(item any, buf []byte) int {
 		buf[6] = byte(v >> 16)
 		buf[7] = byte(v >> 8)
 		buf[8] = byte(v)
-		return 9
+		return 9, nil
 
 	case bool:
 		buf[0] = markerBoolean
 		if item {
 			buf[1] = 1
 		}
-		return 2
+		return 2, nil
 
 	case string:
-		le := len(item)
-		buf[0] = markerString
-		buf[1] = byte(le >> 8)
-		buf[2] = byte(le)
-		copy(buf[3:], item)
-		return 3 + le
+		return marshalString(item, buf), nil
 
 	case ECMAArray:
 		le := len(item)
@@ -378,44 +460,62 @@ func marshalItem(item any, buf []byte) int {
 		n := 5
 
 		for _, entry := range item {
+			err := checkKey(entry.Key)
+			if err != nil {
+				return 0, err
+			}
+
 			le = len(entry.Key)
 			buf[n] = byte(le >> 8)
 			buf[n+1] = byte(le)
 			copy(buf[n+2:], entry.Key)
 			n += 2 + le
 
-			n += marshalItem(entry.Value, buf[n:])
+			written, err := marshalItem(entry.Value, buf[n:], depth+1)
+			if err != nil {
+				return 0, err
+			}
+			n += written
 		}
 
 		buf[n] = 0
 		buf[n+1] = 0
 		buf[n+2] = markerObjectEnd
 
-		return n + 3
+		return n + 3, nil
 
 	case Object:
 		buf[0] = markerObject
 		n := 1
 
 		for _, entry := range item {
+			err := checkKey(entry.Key)
+			if err != nil {
+				return 0, err
+			}
+
 			le := len(entry.Key)
 			buf[n] = byte(le >> 8)
 			buf[n+1] = byte(le)
 			copy(buf[n+2:], entry.Key)
 			n += 2 + le
 
-			n += marshalItem(entry.Value, buf[n:])
+			written, err := marshalItem(entry.Value, buf[n:], depth+1)
+			if err != nil {
+				return 0, err
+			}
+			n += written
 		}
 
 		buf[n] = 0
 		buf[n+1] = 0
 		buf[n+2] = markerObjectEnd
 
-		return n + 3
+		return n + 3, nil
 
 	case Undefined:
 		buf[0] = markerUndefined
-		return 1
+		return 1, nil
 
 	case StrictArray:
 		le := len(item)
@@ -427,14 +527,18 @@ func marshalItem(item any, buf []byte) int {
 		n := 5
 
 		for _, entry := range item {
-			n += marshalItem(entry, buf[n:])
+			written, err := marshalItem(entry, buf[n:], depth+1)
+			if err != nil {
+				return 0, err
+			}
+			n += written
 		}
 
-		return n
+		return n, nil
 
 	default:
 		buf[0] = markerNull
-		return 1
+		return 1, nil
 	}
 }
 

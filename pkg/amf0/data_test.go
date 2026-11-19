@@ -1,6 +1,7 @@
 package amf0_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -367,6 +368,129 @@ func TestObjectGetFloat64(t *testing.T) {
 	v, ok := o.GetFloat64("testme")
 	require.Equal(t, true, ok)
 	require.Equal(t, float64(123), v)
+}
+
+func TestLongStringRoundTrip(t *testing.T) {
+	t.Run("65535 bytes", func(t *testing.T) {
+		// the maximum length that fits in a short string
+		in := amf0.Data{strings.Repeat("a", 0xFFFF)}
+
+		enc, err := in.Marshal()
+		require.NoError(t, err)
+		require.Equal(t, byte(0x02), enc[0])
+
+		dec, err := amf0.Unmarshal(enc)
+		require.NoError(t, err)
+		require.Equal(t, in, dec)
+	})
+
+	t.Run("65536 bytes", func(t *testing.T) {
+		// strings longer than 65535 bytes must use the long string marker
+		in := amf0.Data{strings.Repeat("a", 0x10000)}
+
+		enc, err := in.Marshal()
+		require.NoError(t, err)
+		require.Equal(t, byte(0x0C), enc[0])
+
+		dec, err := amf0.Unmarshal(enc)
+		require.NoError(t, err)
+		require.Equal(t, in, dec)
+	})
+
+	t.Run("nested in object", func(t *testing.T) {
+		in := amf0.Data{amf0.Object{
+			{Key: "key", Value: strings.Repeat("b", 0x10000)},
+		}}
+
+		enc, err := in.Marshal()
+		require.NoError(t, err)
+
+		dec, err := amf0.Unmarshal(enc)
+		require.NoError(t, err)
+		require.Equal(t, in, dec)
+	})
+}
+
+func TestUnmarshalLongString(t *testing.T) {
+	// a long string marker with a length that requires the 32-bit field
+	enc := []byte{0x0C, 0x00, 0x00, 0x00, 0x03, 'a', 'b', 'c'}
+	dec, err := amf0.Unmarshal(enc)
+	require.NoError(t, err)
+	require.Equal(t, amf0.Data{"abc"}, dec)
+
+	// truncated
+	_, err = amf0.Unmarshal([]byte{0x0C, 0x00, 0x00, 0x00, 0x03, 'a', 'b'})
+	require.EqualError(t, err, "buffer is too short")
+}
+
+func TestUnmarshalErrors(t *testing.T) {
+	for _, ca := range []struct {
+		name   string
+		enc    []byte
+		errMsg string
+	}{
+		{
+			"truncated number",
+			[]byte{0x00, 0x00},
+			"buffer is too short",
+		},
+		{
+			"unsupported marker",
+			[]byte{0xFF},
+			"unsupported marker 0xff",
+		},
+		{
+			"object without end",
+			[]byte{0x03, 0x00, 0x01, 'a', 0x05},
+			"buffer is too short",
+		},
+		{
+			"object with wrong end marker",
+			[]byte{0x03, 0x00, 0x01, 'a', 0x05, 0x00, 0x00, 0x01},
+			"object end not found",
+		},
+		{
+			"stric array with missing elements",
+			[]byte{0x0A, 0x00, 0x00, 0x00, 0x02},
+			"buffer is too short",
+		},
+	} {
+		t.Run(ca.name, func(t *testing.T) {
+			_, err := amf0.Unmarshal(ca.enc)
+			require.EqualError(t, err, ca.errMsg)
+		})
+	}
+}
+
+func TestUnmarshalMaxDepth(t *testing.T) {
+	// build a nested object deeper than the maximum
+	// object with a single key "a" that contains another object.
+	var enc []byte
+	enc = make([]byte, 0, 128*4+1+128*3)
+	for range 128 {
+		enc = append(enc, 0x03, 0x00, 0x01, 'a')
+	}
+	enc = append(enc, 0x05)
+	for range 128 {
+		enc = append(enc, 0x00, 0x00, 0x09)
+	}
+
+	_, err := amf0.Unmarshal(enc)
+	require.EqualError(t, err, "maximum nesting level (64) exceeded")
+}
+
+func TestObjectLongKey(t *testing.T) {
+	// keys are encoded with a 16-bit length field; longer keys must be
+	// rejected instead of being silently truncated.
+	_, err := amf0.Data{amf0.Object{
+		{Key: strings.Repeat("k", 0x10000), Value: float64(1)},
+	}}.Marshal()
+	require.EqualError(t, err, "object key length (65536) exceeds maximum (65535)")
+}
+
+func TestMarshalUnsupportedType(t *testing.T) {
+	_, err := amf0.Data{int64(1)}.Marshal()
+	require.EqualError(t, err, "unsupported data type: int64")
 }
 
 func FuzzUnmarshal(f *testing.F) {

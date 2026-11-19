@@ -976,3 +976,50 @@ func (w *Writer) WriteLPCM(track *Track, pts time.Duration, samples []byte) erro
 		DTS:             pts,
 	})
 }
+
+// WriteDataAMF0 writes an AMF0 data event with the given name and value at the
+// given media time. Payload is equivalent to [name, value].
+//
+// Data events are written as soon as this function is called, therefore the
+// caller is responsible for calling it between the audio/video frames that
+// surround the event, in order to preserve the interleaving of the stream.
+//
+// Timestamps follow RTMP and are expressed in milliseconds; values beyond
+// 2^32 milliseconds (about 49.7 days) wrap around on the wire, as required by
+// the protocol.
+//
+// Value can be a float64, bool, string, amf0.Object, amf0.ECMAArray,
+// amf0.StrictArray, amf0.Undefined or nil. Other types are rejected.
+// Values whose encoded size exceeds message.MaxDataAMF0Size are rejected.
+func (w *Writer) WriteDataAMF0(timestamp time.Duration, name string, value any) error {
+	return w.WriteDataAMF0Raw(timestamp, amf0.Data{name, value})
+}
+
+// WriteDataAMF0Raw writes an AMF0 data event with the given payload at the
+// given media time. It can be used to forward an event received through
+// Reader.OnDataAMF0Raw() without losing or altering any element.
+//
+// The same rules of WriteDataAMF0() apply.
+func (w *Writer) WriteDataAMF0Raw(timestamp time.Duration, payload amf0.Data) error {
+	if timestamp < 0 {
+		return fmt.Errorf("timestamp must not be negative")
+	}
+
+	return w.Conn.Write(&message.DataAMF0{
+		ChunkStreamID:   message.AudioChunkStreamID,
+		Timestamp:       timestamp,
+		MessageStreamID: 0x1000000,
+		Payload:         payload,
+	})
+}
+
+// WriteMetadata writes an onMetaData update at the given media time.
+// It is equivalent to a WriteDataAMF0() with name "@setDataFrame" and a
+// payload of [onMetaData, metadata], which is the same format used for the
+// initial metadata sent by Initialize().
+//
+// This can be used to update information that is displayed by players (for
+// example the title of the current track) without interrupting the stream.
+func (w *Writer) WriteMetadata(timestamp time.Duration, metadata amf0.Object) error {
+	return w.WriteDataAMF0Raw(timestamp, amf0.Data{"@setDataFrame", "onMetaData", metadata})
+}

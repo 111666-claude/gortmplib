@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bluenviron/gortmplib"
+	"github.com/bluenviron/gortmplib/pkg/amf0"
 	"github.com/bluenviron/gortmplib/pkg/codecs"
 )
 
@@ -62,6 +63,17 @@ func handlePublisher(sc *gortmplib.ServerConn) error {
 	}()
 
 	log.Printf("conn %v is publishing:", sc.RW.(net.Conn).RemoteAddr())
+
+	// forward in-stream AMF0 data events (e.g. timed metadata updates)
+	// to all players, preserving their timestamp and content.
+	r.OnDataAMF0Raw(func(ts time.Duration, payload amf0.Data) {
+		mutex.Lock()
+		defer mutex.Unlock()
+
+		for _, player := range players {
+			player.WriteDataAMF0Raw(ts, payload) //nolint:errcheck
+		}
+	})
 
 	for _, track := range r.Tracks() {
 		log.Printf("%T", track)

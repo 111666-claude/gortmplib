@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -1110,4 +1111,309 @@ func TestWriterH265ConfigFFmpeg(t *testing.T) {
 			require.Equal(t, ca.hvcC, bodies[0][5:])
 		})
 	}
+}
+
+func TestWriterDataAMF0(t *testing.T) {
+	tracks := []*gortmplib.Track{{Codec: testCodecH264}}
+
+	var input bytes.Buffer
+	var output bytes.Buffer
+	c := &dummyConn{
+		rw: &readWriter{
+			Reader: &input,
+			Writer: &output,
+		},
+	}
+	c.initialize()
+
+	w := &gortmplib.Writer{
+		Conn:   c,
+		Tracks: tracks,
+	}
+	err := w.Initialize()
+	require.NoError(t, err)
+
+	// initial metadata is still sent as before
+	bc := bytecounter.NewReadWriter(&output)
+	mrw := message.NewReadWriter(bc, bc, true)
+
+	msg, err := mrw.Read()
+	require.NoError(t, err)
+	require.Equal(t, &message.DataAMF0{
+		ChunkStreamID:   4,
+		MessageStreamID: 0x1000000,
+		Payload: []any{
+			"@setDataFrame",
+			"onMetaData",
+			amf0.Object{
+				{Key: "videocodecid", Value: float64(message.CodecH264)},
+				{Key: "videodatarate", Value: float64(0)},
+				{Key: "audiocodecid", Value: float64(0)},
+				{Key: "audiodatarate", Value: float64(0)},
+			},
+		},
+	}, msg)
+
+	msg, err = mrw.Read()
+	require.NoError(t, err)
+	require.IsType(t, &message.Video{}, msg)
+
+	// interleave video, data events and audio
+	err = w.WriteH264(tracks[0], 1*time.Second, 1*time.Second,
+		[][]byte{{byte(h264.NALUTypeIDR), 0x01}})
+	require.NoError(t, err)
+
+	err = w.WriteDataAMF0(1500*time.Millisecond, "nowPlaying", amf0.Object{
+		{Key: "title", Value: "second track"},
+		{Key: "artist", Value: "artist 2"},
+	})
+	require.NoError(t, err)
+
+	err = w.WriteH264(tracks[0], 2*time.Second, 2*time.Second,
+		[][]byte{{byte(h264.NALUTypeNonIDR), 0x01}})
+	require.NoError(t, err)
+
+	err = w.WriteMetadata(2500*time.Millisecond, amf0.Object{
+		{Key: "title", Value: "third track"},
+	})
+	require.NoError(t, err)
+
+	var types []uint8
+	var timestamps []time.Duration
+	var payloads [][]any
+
+	for {
+		msg, err = mrw.Read()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		require.NoError(t, err)
+
+		switch msg := msg.(type) {
+		case *message.DataAMF0:
+			types = append(types, uint8(message.TypeDataAMF0))
+			timestamps = append(timestamps, msg.Timestamp)
+			payloads = append(payloads, msg.Payload)
+
+		case *message.Video:
+			types = append(types, uint8(message.TypeVideo))
+			timestamps = append(timestamps, msg.DTS)
+			payloads = append(payloads, nil)
+		}
+	}
+
+	require.Equal(t, []uint8{
+		uint8(message.TypeVideo),
+		uint8(message.TypeDataAMF0),
+		uint8(message.TypeVideo),
+		uint8(message.TypeDataAMF0),
+	}, types)
+
+	require.Equal(t, []time.Duration{
+		1 * time.Second,
+		1500 * time.Millisecond,
+		2 * time.Second,
+		2500 * time.Millisecond,
+	}, timestamps)
+
+	require.Equal(t, []any{
+		"nowPlaying",
+		amf0.Object{
+			{Key: "title", Value: "second track"},
+			{Key: "artist", Value: "artist 2"},
+		},
+	}, payloads[1])
+
+	require.Equal(t, []any{
+		"@setDataFrame",
+		"onMetaData",
+		amf0.Object{
+			{Key: "title", Value: "third track"},
+		},
+	}, payloads[3])
+}
+
+func TestWriterDataAMF0Raw(t *testing.T) {
+	var input bytes.Buffer
+	var output bytes.Buffer
+	c := &dummyConn{
+		rw: &readWriter{
+			Reader: &input,
+			Writer: &output,
+		},
+	}
+	c.initialize()
+
+	w := &gortmplib.Writer{
+		Conn:   c,
+		Tracks: []*gortmplib.Track{{Codec: testCodecH264}},
+	}
+	err := w.Initialize()
+	require.NoError(t, err)
+
+	// a payload with more than two elements is preserved without loss.
+	payload := amf0.Data{
+		"custom",
+		amf0.Object{
+			{Key: "key", Value: "value"},
+		},
+		"extra",
+		float64(123),
+	}
+
+	err = w.WriteDataAMF0Raw(1234*time.Millisecond, payload)
+	require.NoError(t, err)
+
+	bc := bytecounter.NewReadWriter(&output)
+	mrw := message.NewReadWriter(bc, bc, true)
+
+	// skip the initial metadata and the H264 configuration
+	_, err = mrw.Read()
+	require.NoError(t, err)
+	_, err = mrw.Read()
+	require.NoError(t, err)
+
+	msg, err := mrw.Read()
+	require.NoError(t, err)
+	require.IsType(t, &message.DataAMF0{}, msg)
+	require.Equal(t, &message.DataAMF0{
+		ChunkStreamID:   4,
+		Timestamp:       1234 * time.Millisecond,
+		MessageStreamID: 0x1000000,
+		Payload:         payload,
+	}, msg)
+}
+
+func TestWriterDataAMF0Errors(t *testing.T) {
+	t.Run("negative timestamp", func(t *testing.T) {
+		var input bytes.Buffer
+		var output bytes.Buffer
+		c := &dummyConn{
+			rw: &readWriter{
+				Reader: &input,
+				Writer: &output,
+			},
+		}
+		c.initialize()
+
+		w := &gortmplib.Writer{
+			Conn:   c,
+			Tracks: []*gortmplib.Track{{Codec: testCodecH264}},
+		}
+		err := w.Initialize()
+		require.NoError(t, err)
+
+		err = w.WriteDataAMF0(-time.Second, "test", nil)
+		require.EqualError(t, err, "timestamp must not be negative")
+	})
+
+	t.Run("unsupported value", func(t *testing.T) {
+		var input bytes.Buffer
+		var output bytes.Buffer
+		c := &dummyConn{
+			rw: &readWriter{
+				Reader: &input,
+				Writer: &output,
+			},
+		}
+		c.initialize()
+
+		w := &gortmplib.Writer{
+			Conn:   c,
+			Tracks: []*gortmplib.Track{{Codec: testCodecH264}},
+		}
+		err := w.Initialize()
+		require.NoError(t, err)
+
+		err = w.WriteDataAMF0(0, "test", int64(1))
+		require.EqualError(t, err, "unsupported data type: int64")
+	})
+
+	t.Run("too big value", func(t *testing.T) {
+		serverConn, clientConn := net.Pipe()
+		defer serverConn.Close()
+		defer clientConn.Close()
+
+		server := &dummyConn{rw: serverConn}
+		server.initialize()
+
+		client := &dummyConn{rw: clientConn}
+		client.initialize()
+
+		// read everything the writer sends, until the connection is closed
+		clientReadDone := make(chan struct{})
+		go func() {
+			defer close(clientReadDone)
+
+			for {
+				_, err := client.Read()
+				if err != nil {
+					return
+				}
+			}
+		}()
+
+		w := &gortmplib.Writer{
+			Conn:   server,
+			Tracks: []*gortmplib.Track{{Codec: testCodecH264}},
+		}
+		err := w.Initialize()
+		require.NoError(t, err)
+
+		err = w.WriteDataAMF0(0, "test", strings.Repeat("a", 2*1024*1024))
+		require.EqualError(t, err, "payload size (2097164) exceeds maximum (1048576)")
+
+		// the connection is still usable after a rejected write
+		err = w.WriteDataAMF0(0, "test", "small")
+		require.NoError(t, err)
+
+		serverConn.Close()
+		<-clientReadDone
+	})
+
+	t.Run("disconnected", func(t *testing.T) {
+		serverConn, clientConn := net.Pipe()
+		defer serverConn.Close()
+		defer clientConn.Close()
+
+		server := &dummyConn{rw: serverConn}
+		server.initialize()
+
+		client := &dummyConn{rw: clientConn}
+		client.initialize()
+
+		// read everything the writer sends, until the connection is closed
+		clientReadDone := make(chan struct{})
+		go func() {
+			defer close(clientReadDone)
+
+			for {
+				_, err := client.Read()
+				if err != nil {
+					return
+				}
+			}
+		}()
+
+		w := &gortmplib.Writer{
+			Conn:   server,
+			Tracks: []*gortmplib.Track{{Codec: testCodecH264}},
+		}
+		err := w.Initialize()
+		require.NoError(t, err)
+
+		err = w.WriteDataAMF0(0, "test", nil)
+		require.NoError(t, err)
+
+		// close the connection; the internal reader must report the error
+		clientConn.Close()
+
+		// the internal reader reports the end of the connection
+		require.Equal(t, io.EOF, w.Wait())
+		<-clientReadDone
+
+		// writes after a disconnection return the write error deterministically
+		err = w.WriteDataAMF0(0, "test", nil)
+		require.Equal(t, io.ErrClosedPipe, err)
+	})
 }
